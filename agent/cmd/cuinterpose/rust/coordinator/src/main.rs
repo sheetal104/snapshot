@@ -4,6 +4,8 @@
 //! Validate participants, coordinate CUDA lifecycle phases, and publish state.
 
 mod state;
+#[cfg(test)]
+mod test_records;
 mod topology;
 
 use anyhow::{Context, Result, bail, ensure};
