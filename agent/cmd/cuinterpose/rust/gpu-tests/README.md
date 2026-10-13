@@ -60,3 +60,4 @@ the agent.
 | `malloc_peer_access` | Peer access grants on converted mallocs |
 | `multicast_restore` | Multicast bindings through a native checkpoint |
 | `multicast_bind_ordering` | Multicast bind and unbind ordering |
+| `peer_carriers` | Unexported allocations that another GPU can access |

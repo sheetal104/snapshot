@@ -17,4 +17,5 @@ mod legacy_ipc;
 mod malloc_peer_access;
 mod multicast_bind_ordering;
 mod multicast_restore;
+mod peer_carriers;
 mod symbol_resolution;
