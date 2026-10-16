@@ -1,0 +1,27 @@
+# Host-cluster PV for the vCluster-synced Snapshot PVC (apply with HOST kubecontext).
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: shsriram-dev-snapshot-checkpoints-host
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  local:
+    path: /mnt/k8s-disks/0/shsriram-vcluster-checkpoints
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - ip-100-66-183-52.ec2.internal
+  claimRef:
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    name: snapshot-pvc-x-shsriram-dev-x-shsriram-dev
+    namespace: shsriram-vcluster

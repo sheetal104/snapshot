@@ -1,0 +1,13 @@
+# Apply with vCluster kubecontext (no volumeName — binds to host PV shsriram-dev-snapshot-checkpoints).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: snapshot-pvc
+  namespace: shsriram-dev
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 200Gi
+  storageClassName: ""

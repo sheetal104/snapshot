@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import json
+import shlex
 import sys
 import uuid
 from typing import Callable
@@ -79,6 +81,98 @@ class BenchmarkConfig:
         )
 
 
+def _assigned_gpu_uuids(pod) -> list[str]:
+    """GPU UUIDs the device plugin recorded on a running pod.
+
+    Restore often lands on a different GPU than capture. The checkpoint's
+    `/run/nvidia-container-devices/GPU-<uuid>` mount is not remapped, so the
+    restore pod has to recreate that mount itself.
+    """
+    raw = (pod.metadata.annotations or {}).get("dgxc.nvidia.com/devices")
+    if not raw:
+        return []
+    try:
+        devices = json.loads(raw).get("devices", {}).get("nvidia.com/gpu", [])
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [gpu_uuid for gpu_uuid in devices if isinstance(gpu_uuid, str) and gpu_uuid]
+
+
+def _wait_for_container_running(
+    namespace: str, name: str, container_name: str, *, timeout: int
+) -> client.V1Pod:
+    def check() -> client.V1Pod | None:
+        pod = k8s.read_pod(namespace, name)
+        for status in pod.status.container_statuses or []:
+            if status.name == container_name and status.state and status.state.running:
+                return pod
+        if pod.status.phase in lifecycle.TERMINAL_POD_PHASES:
+            raise AssertionError(
+                f"pod {namespace}/{name} reached phase {pod.status.phase} "
+                f"before container {container_name} was running"
+            )
+        return None
+
+    return lifecycle.wait_for(
+        f"pod {namespace}/{name} container {container_name} running",
+        check,
+        timeout,
+    )
+
+
+def _bind_source_gpu_mounts(cfg: BenchmarkConfig, restore_name: str, uuids: list[str]) -> None:
+    """Bind a null device over each source CDI path inside the restore pod.
+
+    Done from the privileged agent, before `nvidia.com/restore-from` is set.
+    The workload container cannot mount, and giving it every host GPU makes
+    the compatibility check reject a 1-GPU checkpoint.
+    """
+    agents = k8s.list_snapshot_pods(cfg.snapshot_namespace, cfg.release, "snapshot-agent")
+    restore_pod = k8s.read_pod(cfg.workload_namespace, restore_name)
+    agent = next(
+        (pod.metadata.name for pod in agents if pod.spec.node_name == restore_pod.spec.node_name),
+        None,
+    )
+    if agent is None:
+        raise RuntimeError(f"no snapshot-agent on {restore_pod.spec.node_name}")
+    quoted = " ".join(shlex.quote(gpu_uuid) for gpu_uuid in uuids)
+    script = f"""
+set -eu
+pid=
+for d in /proc/[0-9]*; do
+  cmd=$(tr '\\0' ' ' < "$d/cmdline" 2>/dev/null || true)
+  case "$cmd" in
+    "sleep infinity "*)
+      host=$(nsenter -t "${{d#/proc/}}" -u hostname 2>/dev/null || true)
+      if [ "$host" = {shlex.quote(restore_name)} ]; then
+        pid=${{d#/proc/}}
+        break
+      fi
+      ;;
+  esac
+done
+if [ -z "$pid" ]; then
+  echo "sleep infinity for {restore_name} not found" >&2
+  exit 1
+fi
+nsenter -t "$pid" -m -- sh -c 'for uuid in {quoted}; do
+  dir=/run/nvidia-container-devices
+  mkdir -p "$dir"
+  path="$dir/$uuid"
+  if grep -F -q " $path " /proc/self/mountinfo; then
+    continue
+  fi
+  if [ ! -e "$path" ]; then
+    touch "$path"
+  fi
+  mount --bind /dev/null "$path"
+done'
+"""
+    output = k8s.exec_command(cfg.snapshot_namespace, agent, script, container="agent")
+    if output.strip():
+        print(output.strip(), file=sys.stderr)
+
+
 def _wait_for_pod_condition(
     namespace: str,
     name: str,
@@ -127,7 +221,11 @@ def _container_started_at(pod, container_name: str) -> datetime.datetime | None:
 
 
 def _du_bytes(namespace: str, agent_pod: str, path: str) -> int | None:
-    output = k8s.exec_command(namespace, agent_pod, f"du -sb {path} | cut -f1")
+    # Named explicitly: the agent pod carries a PageBroker sidecar, and exec
+    # without a container is a 400 on a multi-container pod.
+    output = k8s.exec_command(
+        namespace, agent_pod, f"du -sb {path} | cut -f1", container="agent"
+    )
     stripped = output.strip().splitlines()[-1].strip() if output.strip() else ""
     return int(stripped) if stripped.isdigit() else None
 
@@ -290,6 +388,9 @@ def run_benchmark(
             )
             result.checkpoint_image = _collect_checkpoint_image(cfg, capture_node, content_uid)
 
+            source_gpu_uuids = _assigned_gpu_uuids(
+                k8s.read_pod(cfg.workload_namespace, source_name)
+            )
             progress(f"[{run_id}] deleting source pod {source_name} to free the GPU")
             k8s.delete_pod(cfg.workload_namespace, source_name)
             lifecycle.wait_for_pod_deleted(cfg.workload_namespace, source_name)
@@ -306,8 +407,28 @@ def run_benchmark(
                 image_pull_policy=image_pull_policy,
                 tolerations=tolerations,
             )
+            # The agent restores as soon as this annotation is present. Hold it
+            # until the source GPU's CDI file is mounted, or a different GPU
+            # assignment is refused before CRIU starts.
+            restore_from = restore_manifest["metadata"]["annotations"].pop(
+                "nvidia.com/restore-from"
+            )
             restore_created_pod = k8s.create_pod(restore_manifest)
             restore_created = True
+            _wait_for_container_running(
+                cfg.workload_namespace, restore_name, engine.container_name, timeout=timeout
+            )
+            if source_gpu_uuids:
+                progress(
+                    f"[{run_id}] mounting source GPU CDI "
+                    f"{' '.join(source_gpu_uuids)} into {restore_name}"
+                )
+                _bind_source_gpu_mounts(cfg, restore_name, source_gpu_uuids)
+            client.CoreV1Api().patch_namespaced_pod(
+                restore_name,
+                cfg.workload_namespace,
+                {"metadata": {"annotations": {"nvidia.com/restore-from": restore_from}}},
+            )
 
             progress(f"[{run_id}] waiting for nvidia.com/Restored=True (Snapshot restore)")
             restored_pod = lifecycle.wait_for_restored_condition(
@@ -505,6 +626,7 @@ def _collect_checkpoint_image(
             cfg.snapshot_namespace,
             agent_pod,
             image.inventory_command(lifecycle.checkpoint_artifact_root(content_uid)),
+            container="agent",
         )
         return image.parse_inventory(output)
     except AssertionError as exc:

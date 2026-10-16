@@ -1,0 +1,37 @@
+# Static checkpoint store for Snapshot in vCluster (avoids FSx dynamic provision timeouts).
+# Pin the agent DaemonSet to the same node (see helm --set daemonset.nodeSelector below).
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: shsriram-dev-snapshot-checkpoints
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  local:
+    path: /mnt/k8s-disks/0/shsriram-vcluster-checkpoints
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - ip-100-66-183-52.ec2.internal
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: snapshot-pvc
+  namespace: shsriram-dev
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 200Gi
+  volumeName: shsriram-dev-snapshot-checkpoints
+  storageClassName: ""

@@ -21,4 +21,6 @@ dashboard/test-results/
 
 # Benchmarks Python workspace
 benchmarks/.venv/
-benchmarks/results/
+# Raw sweep output stays local. The written report is tracked.
+benchmarks/results/*
+!benchmarks/results/capture-latency-report/

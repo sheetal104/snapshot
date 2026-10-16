@@ -619,7 +619,12 @@ def wait_for_restored_condition(
         restored = pod_condition(pod, RESTORED_CONDITION)
         if restored and restored.status == status and restored.reason == reason:
             return pod
-        terminal_reasons = {"RestoreSucceeded", "RestorePartiallySucceeded", "RestoreFailed"}
+        terminal_reasons = {
+            "RestoreSucceeded",
+            "RestorePartiallySucceeded",
+            "RestoreFailed",
+            "RestoreIncompatible",
+        }
         if restored and restored.reason in terminal_reasons and restored.reason != reason:
             raise AssertionError(
                 f"restore reached unexpected terminal condition for "

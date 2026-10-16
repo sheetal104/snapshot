@@ -106,6 +106,8 @@ def build_source_pod(
             "name": name,
             "namespace": namespace,
             "labels": dict(template_metadata.get("labels", {})),
+            # Opt in. The running agent treats a missing annotation as PageBroker off.
+            "annotations": {"nvidia.com/snapshot-pagebroker": "true"},
         },
         "spec": pod_spec,
     }
@@ -132,6 +134,8 @@ def build_restore_pod(
     )
     annotations = dict(template_metadata.get("annotations", {}))
     annotations[RESTORE_FROM_ANNOTATION] = snapshot_name
+    # Same opt-in as the source. Restore stages through PageBroker only when this is "true".
+    annotations["nvidia.com/snapshot-pagebroker"] = "true"
     return {
         "apiVersion": "v1",
         "kind": "Pod",
