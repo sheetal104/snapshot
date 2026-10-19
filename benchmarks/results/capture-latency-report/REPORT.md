@@ -130,7 +130,7 @@ A sampler inside the agent read CRIU's and every dumped task's state, CPU time, 
 | `criu_dump` | 19.77 s | **11.42 s** |
 | Zombie tasks | all three | none |
 
-The control build reproduces the matrix agent (19.77 s vs **19.50 s** median on **direct · 96Gi**, §4), so the swap isn't a confound.
+The control build matched the matrix agent closely (19.77 s vs **19.50 s** median on **direct · 96Gi**, §4).
 
 **Not proven:** which kernel function does the work. A zombie's stack isn't readable, so the evidence is the amount, location and scaling of the CPU. That fits address-space teardown but does not name a frame.
 
