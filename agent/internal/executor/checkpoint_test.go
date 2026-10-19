@@ -252,10 +252,7 @@ func TestCheckpointPreparationFailure(t *testing.T) {
 					response := &pagebroker.Response{}
 					switch phase {
 					case "prepare":
-						received := request.GetPrepareStagedCheckpoint().GetDestination().GetFilesystem().GetDirectory()
-						if format == "custom-storage" {
-							received = request.GetPrepareDirectCheckpoint().GetDestination().GetFilesystem().GetDirectory()
-						}
+						received := request.GetPrepareDirectCheckpoint().GetDestination().GetFilesystem().GetDirectory()
 						transactionID = request.GetTransactionId()
 						if received != destination || transactionID == "" {
 							return fmt.Errorf("unexpected checkpoint preparation: %v", request)

@@ -496,8 +496,10 @@ func abortCheckpointTransaction(broker pagebroker.Client, transactionID string, 
 }
 
 func prepareCheckpoint(ctx context.Context, broker pagebroker.Client, transactionID, destination string, gpuContext *pagebroker.GpuContext) (string, *pagebroker.CustomStorageExecution, error) {
+	// Write the image beside the destination and let commit rename it into place.
+	// The staged prepare copies the finished image onto the checkpoint volume.
 	if gpuContext == nil {
-		directory, err := broker.PrepareCheckpoint(ctx, transactionID, destination)
+		directory, err := broker.PrepareDirectCheckpoint(ctx, transactionID, destination)
 		return directory, nil, err
 	}
 	return broker.PrepareGPUCheckpoint(ctx, transactionID, destination, gpuContext)

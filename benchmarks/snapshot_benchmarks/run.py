@@ -20,6 +20,7 @@ import datetime
 import json
 import shlex
 import sys
+import threading
 import uuid
 from typing import Callable
 
@@ -120,53 +121,56 @@ def _wait_for_container_running(
     )
 
 
-def _bind_source_gpu_mounts(cfg: BenchmarkConfig, restore_name: str, uuids: list[str]) -> None:
-    """Bind a null device over each source CDI path inside the restore pod.
+def _bind_source_gpu_mounts(
+    cfg: BenchmarkConfig, restore_name: str, node_name: str, uuids: list[str]
+) -> None:
+    """Create each source CDI path inside the restore pod.
 
-    Done from the privileged agent, before `nvidia.com/restore-from` is set.
-    The workload container cannot mount, and giving it every host GPU makes
-    the compatibility check reject a 1-GPU checkpoint.
+    The compatibility check stats `/run/nvidia-container-devices/GPU-<uuid>`
+    in the restore container and refuses the checkpoint when that path is
+    missing. The restore proxy is already PID 1, so this has to land before
+    the agent inspects the container.
     """
     agents = k8s.list_snapshot_pods(cfg.snapshot_namespace, cfg.release, "snapshot-agent")
-    restore_pod = k8s.read_pod(cfg.workload_namespace, restore_name)
     agent = next(
-        (pod.metadata.name for pod in agents if pod.spec.node_name == restore_pod.spec.node_name),
+        (pod.metadata.name for pod in agents if pod.spec.node_name == node_name),
         None,
     )
     if agent is None:
-        raise RuntimeError(f"no snapshot-agent on {restore_pod.spec.node_name}")
+        raise RuntimeError(f"no snapshot-agent on {node_name}")
     quoted = " ".join(shlex.quote(gpu_uuid) for gpu_uuid in uuids)
     script = f"""
 set -eu
 pid=
-for d in /proc/[0-9]*; do
-  cmd=$(tr '\\0' ' ' < "$d/cmdline" 2>/dev/null || true)
-  case "$cmd" in
-    "sleep infinity "*)
-      host=$(nsenter -t "${{d#/proc/}}" -u hostname 2>/dev/null || true)
-      if [ "$host" = {shlex.quote(restore_name)} ]; then
-        pid=${{d#/proc/}}
-        break
-      fi
-      ;;
-  esac
+deadline=$((SECONDS+30))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  for comm in $(grep -l -x snapshot-restor /proc/[0-9]*/comm 2>/dev/null || true); do
+    proc=${{comm%/comm}}
+    host=$(nsenter -t "${{proc#/proc/}}" -u hostname 2>/dev/null || true)
+    if [ "$host" = {shlex.quote(restore_name)} ]; then
+      pid=${{proc#/proc/}}
+      break
+    fi
+  done
+  if [ -n "$pid" ]; then
+    break
+  fi
+  sleep 0.02
 done
 if [ -z "$pid" ]; then
-  echo "sleep infinity for {restore_name} not found" >&2
+  echo "restore container {restore_name} not found" >&2
   exit 1
 fi
 nsenter -t "$pid" -m -- sh -c 'for uuid in {quoted}; do
   dir=/run/nvidia-container-devices
   mkdir -p "$dir"
   path="$dir/$uuid"
-  if grep -F -q " $path " /proc/self/mountinfo; then
-    continue
-  fi
   if [ ! -e "$path" ]; then
     touch "$path"
   fi
-  mount --bind /dev/null "$path"
+  mount --bind /dev/null "$path" || true
 done'
+echo "bound CDI for pid $pid"
 """
     output = k8s.exec_command(cfg.snapshot_namespace, agent, script, container="agent")
     if output.strip():
@@ -407,28 +411,34 @@ def run_benchmark(
                 image_pull_policy=image_pull_policy,
                 tolerations=tolerations,
             )
-            # The agent restores as soon as this annotation is present. Hold it
-            # until the source GPU's CDI file is mounted, or a different GPU
-            # assignment is refused before CRIU starts.
-            restore_from = restore_manifest["metadata"]["annotations"].pop(
-                "nvidia.com/restore-from"
-            )
-            restore_created_pod = k8s.create_pod(restore_manifest)
-            restore_created = True
-            _wait_for_container_running(
-                cfg.workload_namespace, restore_name, engine.container_name, timeout=timeout
-            )
+            # The annotation has to be present when the container is created.
+            # The agent's NRI plugin reads it then and makes snapshot-restore-proxy
+            # PID 1. Adding it later leaves PID 1 as the image command, and the
+            # agent refuses the restore. The source CDI path still has to exist
+            # before that inspection, so the watcher is already scanning when
+            # the proxy process appears.
+            bind_error: list[BaseException] = []
+            bind_thread: threading.Thread | None = None
             if source_gpu_uuids:
                 progress(
                     f"[{run_id}] mounting source GPU CDI "
                     f"{' '.join(source_gpu_uuids)} into {restore_name}"
                 )
-                _bind_source_gpu_mounts(cfg, restore_name, source_gpu_uuids)
-            client.CoreV1Api().patch_namespaced_pod(
-                restore_name,
-                cfg.workload_namespace,
-                {"metadata": {"annotations": {"nvidia.com/restore-from": restore_from}}},
-            )
+
+                def _bind() -> None:
+                    try:
+                        _bind_source_gpu_mounts(cfg, restore_name, capture_node, source_gpu_uuids)
+                    except BaseException as exc:
+                        bind_error.append(exc)
+
+                bind_thread = threading.Thread(target=_bind, name="bind-source-cdi")
+                bind_thread.start()
+            restore_created_pod = k8s.create_pod(restore_manifest)
+            restore_created = True
+            if bind_thread is not None:
+                bind_thread.join()
+                if bind_error:
+                    raise bind_error[0]
 
             progress(f"[{run_id}] waiting for nvidia.com/Restored=True (Snapshot restore)")
             restored_pod = lifecycle.wait_for_restored_condition(

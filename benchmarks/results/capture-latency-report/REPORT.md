@@ -134,7 +134,7 @@ The control build reproduces the deployed binary (19.77 s vs the 19.50 s three-r
 - **~8 s (40%) of every 14B capture is removable without touching storage.** The image is complete and closed before the reap begins.
 - **Direct I/O is the strongest storage path** and is robust to agent memory sizing.
 - **Writeback is within ~3 s of direct** once the agent's memory limit doesn't throttle page cache.
-- **PageBroker's cost is concentrated** in the staging write rate and a 20 s publish, both on an Oct 5 build that HEAD has since changed.
+- **PageBroker's cost is concentrated** in the staging write rate and a ~20 s publish on the Oct 5 build. On HEAD, restore no longer copies through staging; capture publish is still a copy until the agent uses `PrepareDirectCheckpoint` (§10).
 
 ## 9. Next steps
 
@@ -142,19 +142,111 @@ The control build reproduces the deployed binary (19.77 s vs the 19.50 s three-r
 - **Take the reap off the critical path.** Either patch CRIU to write stats and return before `wait4`, or keep the cgroup frozen, dump with leave-running, mark the snapshot ready, then SIGKILL and reap asynchronously. The second option needs validation that the source cannot run between unseize and kill.
 - **Size the agent for buffered writes** (or default to direct). A 4Gi limit costs writeback ~9 s at 14B.
 
-**Explore**
-- **Page size of the engine's memory.** Check `AnonHugePages` and pinned host buffers. 4 KiB pages make teardown far costlier than 2 MiB pages, so THP could shrink the tail even if the reap stays synchronous.
-- **GPU release timing.** Check whether the GPU stays held until the reap finishes, which would also delay the next pod.
-- **PageBroker on HEAD.** Parallel publish and PVC-direct restore should change both of its costs.
-- **Restore-side breakdown.** Apply the same `/proc` sampler to `criu_restore` (~9 s) and `cuda_restore` (~13 s) at 14B, which remain unexplained.
+**Explore** — results are in §10.
+- Page size, GPU release, and restore split: done on the Oct 5 agent.
+- Matched HEAD deploy (`e73a6112`) and direct checkpoint publish: done in §10.
+- Deeper profiling inside `cuda_restore` (~12–14 s): still open; the explore sampler was too slow.
 
-## 10. Caveats
+## 10. Explore results
+
+Three of the four items, from one 14B capture on the same direct / 96Gi / PageBroker-off setup. Raw logs are in `benchmarks/results/explore-probe/` (local, not committed).
+
+### Page size: the 45 GiB is 4 KiB memfd, not THP and not pinned
+
+Census of `VLLM::EngineCor` (333 threads), taken while it was running and confirmed on the restored process:
+
+| Field | Value |
+|---|---:|
+| VmRSS | 45.1 GiB |
+| RssShmem | 42.6 GiB |
+| RssAnon | 1.8 GiB |
+| RssFile | 0.7 GiB |
+| AnonHugePages | 0 |
+| HugetlbPages | 0 |
+| VmLck / Locked | 16 KiB |
+| VmPTE | 95 MiB |
+| memfd mappings | 179, RSS = size, huge pages 0 |
+
+The resident set is 179 `memfd:/dev/zero` mappings. Host THP is `madvise` for anonymous memory and `never` for shmem, and nothing in this process opted in: no huge mappings at all. The 95 MiB page tables match 4 KiB PTEs for that shmem (42.6 GiB / 4 KiB × 8 B ≈ 87 MiB, plus the rest of the address space). Locked memory is 16 KiB, so pinned host buffers are not the tail.
+
+Turning on anonymous THP would not touch this. The pages that get torn down are shmem. Shrinking the tail without moving the reap means shmem THP or a 2 MiB memfd, and that is an application change, not a CRIU flag.
+
+### GPU release: the reap does not hold the device
+
+`nvidia-smi` index order inside the agent container moves between samples, so this is by UUID. The capture's GPU was `GPU-47409b11` (the CDI path the benchmark later bind-mounted for restore). sglang's two GPUs stayed at 70436 MiB the whole time.
+
+| Moment | Engine state | `GPU-47409b11` used |
+|---|---|---:|
+| RSS crossed 25 GiB, 30 s before freeze | running | 26569 MiB, falling |
+| 3 s before freeze | sleeping | 0 |
+| CRIU freeze (`t`) through the zombie window | traced, then zombie | 0 |
+| After restore, different GPU `GPU-2efb04e8` | restored engine | 40023 MiB |
+
+The device is already free before CRIU freezes the tasks, so the 8 s reap does not delay the next pod. One `cuda-checkpoint-helper` sample during the drain was blocked in `anon_pipe_read`; the agent's own `cuda_checkpoint` phase on these runs is 3.5–3.9 s and finishes before `criu_dump`. The drain itself took longer than that phase, so this does not pin the whole drop on the helper.
+
+### Restore split: reading the image, then CUDA
+
+Agent restore summaries, PageBroker off, two 14B runs:
+
+| Phase | Run 1 | Run 2 |
+|---|---:|---:|
+| `criu_restore` | 7.64 s | 8.74 s |
+| `cuda_restore` | 12.56 s | 13.98 s |
+| everything else | < 0.3 s | < 0.3 s |
+| restore total | 20.5 s | 23.0 s |
+
+`cuda_restore` is `RestoreAndUnlockProcessTree`: for each CUDA pid, `cuda-checkpoint-helper` restores, then unlocks, one pid at a time. The sampler was too slow (a `nvidia-smi` per sample) to profile those 14 s. The one useful restore sample is CRIU at the end of its read: 43.7 GiB already read, stack in `io_destroy`. So the ~8 s is reading the image back, and the ~14 s is the helper putting CUDA state back. Neither is broken down further yet.
+
+### HEAD stack (`e73a6112`): matched deploy, direct restore, staged capture publish
+
+Operator, agent, and PageBroker were upgraded together to git `e73a6112` on the same node (`imageIoMode: direct`, `pageBroker.restoreMode: direct`, agent memory 96Gi). PageBroker is mandatory on this revision; the pod annotation from the benchmark is harmless.
+
+**Restore (n=1, Qwen3 14B).** PageBroker stage, mount, and commit are all under 2 ms. The time is CRIU read plus CUDA helper, same split as the Oct 5 direct path but faster end to end because nothing copies the image into the staging emptyDir first.
+
+| Phase | Oct 5 direct (§10) | HEAD `e73a6112` |
+|---|---:|---:|
+| `criu_restore` | 7.6–8.7 s | 7.7 s |
+| `cuda_restore` | 12.6–14.0 s | 12.5 s |
+| PageBroker stage + mount + commit | n/a (broker off) | < 0.002 s |
+| Agent restore total | 20.5–23.0 s | 20.4 s |
+| Pod Ready (benchmark) | — | 25 s |
+
+**Capture with default prepare (still staged publish).** One 14B run on the stock `e73a6112` agent before the direct-prepare patch:
+
+| Phase | Oct 5 direct median (§4) | HEAD staged publish |
+|---|---:|---:|
+| `cuda_checkpoint` | ~3.5 s | 3.6 s |
+| `criu_dump` | 19.5 s | 34.8 s |
+| `remove_old_version_and_switch` (publish copy) | rename | 18.8 s |
+| Checkpoint total | 19.5 s `criu_dump` wall* | 57.7 s |
+
+\*Oct 5 table uses agent `criu_dump` phase only; HEAD rows use the agent checkpoint summary duration (57.7 s) for the staged run.
+
+CRIU on HEAD was writing the memory staging directory, so the dump phase itself is slower than O_DIRECT to the PVC on the Oct 5 path, and commit still paid a single-threaded copy (~2.5 GB/s) like the old PageBroker publish.
+
+### Direct checkpoint publish (`PrepareDirectCheckpoint`)
+
+The PageBroker API already supported writing beside the destination and promoting with a rename; the agent still called `PrepareCheckpoint` (staged). Wiring `prepareCheckpoint` to `PrepareDirectCheckpoint` for non-GPU-custom-storage captures removes the publish copy. Deployed as image tag `e73a6112-direct` (same tree as `e73a6112` plus this one-line call-site change). One full 14B capture and restore (run `0ce4d248b731`, result under `benchmarks/results/20261019-2f70fe3d-0c7df784/`):
+
+| Phase | HEAD staged publish | HEAD direct publish |
+|---|---:|---:|
+| `cuda_checkpoint` | 3.6 s | 2.6 s |
+| `criu_dump` | 34.8 s | 21.2 s |
+| `remove_old_version_and_switch` | 18.8 s | **0.001 s** |
+| Checkpoint total | 57.7 s | **24.2 s** |
+| Restore (agent) | 22.6 s | 20.4 s |
+
+Artifact size unchanged (~47.7 GiB). The ~8 s post-write tail was not remeasured on HEAD; nothing in the direct-prepare change moves kernel reap off the critical path.
+
+**Benchmark changes for HEAD restores.** The NRI plugin only installs `snapshot-restore-proxy` when `nvidia.com/restore-from` is present at container creation, so the benchmark no longer patches that annotation in after start. The compatibility gate still requires the source GPU CDI path (`/run/nvidia-container-devices/GPU-<uuid>`) to exist in the restore container; a privileged agent watcher creates it as soon as the proxy process appears.
+
+## 11. Caveats
 
 - Leave-running is **not a supported mode**: a CUDA-locked source is never resumed, and the operator expects the source to die. Its restore succeeded only because the benchmark deletes the source pod before restoring.
 - Root-cause probes are n=1 per configuration. The 8 s → 0.01 s delta is far outside the ~±0.3 s run-to-run spread.
-- PageBroker figures reflect the Oct 5 (`a3cb9545`) build, not HEAD.
-- Nothing was committed. The diagnostic binaries remain on the PVC (`/checkpoints/dev/snapshot-agent-{control,leaverunning}`), and the agent runs the original build.
+- §4 path matrix and tail probes are on the Oct 5 (`a3cb9545`) agent. §10 HEAD numbers are n=1 each unless noted.
+- Diagnostic binaries may remain on the PVC (`/checkpoints/dev/snapshot-agent-{control,leaverunning}`); production pods use the container image entrypoint, not those paths.
 
 ---
 
-**Data.** `benchmarks/results/`: `20261014-*`, `20261015-*`, `20261016-*`, `tail-probe/`, `leaverunning-control/`, `leaverunning-test/`, each with an `ARM.txt`. Sampler logs sit next to the probe results. Regenerate the plots with `uv run --no-project --with matplotlib python make_plots.py`.
+**Data.** `benchmarks/results/`: `20261014-*`, `20261015-*`, `20261016-*`, `20261019-*` (HEAD direct run JSON only in gitignored trees except this report), `tail-probe/`, `leaverunning-control/`, `leaverunning-test/`, each with an `ARM.txt` where applicable. Sampler logs sit next to the probe results. Regenerate the plots with `uv run --no-project --with matplotlib python make_plots.py`.
