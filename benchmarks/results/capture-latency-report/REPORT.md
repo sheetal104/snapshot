@@ -1,10 +1,10 @@
 # Scale-dependent CRIU capture latency: where the time goes
 
-**Bottom line (capture).** The data is enough to justify work on *scale-dependent CRIU capture latency*: latency grows with model size, the dominant delays are named, and at least two are fixable in product (not “CRIU is slow” in the abstract).
+**Summary (capture).** Exploration notes for discussion around *scale-dependent CRIU capture latency* — not a sign-off or priority call. One vLLM workload on one node; findings below are what we measured and how we read them.
 
-On the best **matrix** path (agent git **`a3cb9545`**, direct I/O, 96 Gi agent, PageBroker off), a 14B capture spends **~19.5 s in `criu_dump`**, split into **~11 s writing the image** and **~8 s after the image is complete**. That post-write block is **kernel reap of the killed engine** (`wait4`), identical on every storage arm and scaling **~0.15 s/GB**. A diagnostic build that skips the kill cut **`criu_dump` from 19.77 s to 11.42 s** with the same bytes and write rate — so **~8 s (~40%) is removable** without faster disks.
+On the best **matrix** path (agent git **`a3cb9545`**, direct I/O, 96 Gi agent, PageBroker off), a 14B capture spends **~19.5 s in `criu_dump`** (median of 3 runs), split into **~11 s writing the image** and **~8 s after the image is complete**. That post-write block looks like **kernel reap of the killed engine** (`wait4`): same on every storage arm in the matrix, scaling about **~0.15 s/GB** across five model sizes. A diagnostic build that skips the kill saw **`criu_dump` fall from 19.77 s to 11.42 s** with the same bytes and write rate — the **~8 s gap lines up with the post-write window**, not with image I/O.
 
-On **upstream `e73a6112`** (matched operator/agent/PageBroker upgrade), the stock agent still published through a **staged copy (~19 s)** until wired to **`PrepareDirectCheckpoint`** (**`e73a6112-direct`** image, commit `485f2671`). That drops publish to a rename and cuts **checkpoint wall time from 57.7 s to 24.2 s** (single run `0ce4d248b731`). After the patch, **~21 s `criu_dump` + ~3 s CUDA** remain; the reap tail was not remeasured on `e73a6112` but nothing in direct prepare moves it off the critical path.
+On **upstream `e73a6112`**, the stock agent published through a **staged copy (~19 s)** in our single capture run. Wiring **`PrepareDirectCheckpoint`** (**`e73a6112-direct`**, commit `485f2671`, run `0ce4d248b731`) made publish a rename and moved **checkpoint wall time from 57.7 s to 24.2 s** in that one run. **`criu_dump` was still ~21 s** afterward; we did not remeasure the post-write tail on `e73a6112`.
 
 | Headline | Value |
 |---|---|
@@ -18,7 +18,7 @@ On **upstream `e73a6112`** (matched operator/agent/PageBroker upgrade), the stoc
 
 ## 1. Context and aim
 
-Capture latency grows with model size (issue: *Reduce scale-dependent CRIU capture latency*). The aim was to locate **capture** bottlenecks inside each path so the issue can be prioritized on measured upside, not to pick a winning storage configuration.
+This report documents a local exploration tied to the issue *Reduce scale-dependent CRIU capture latency*. The aim was to map **capture** time inside several agent/storage configurations and share observations — not to pick a winning path or decide what the project should ship.
 
 **Questions**
 - Which phases of the dump scale with model size?
@@ -40,7 +40,7 @@ Capture latency grows with model size (issue: *Reduce scale-dependent CRIU captu
 
 ### Agent builds used in this report
 
-External readers only need these names; sections below refer to them explicitly.
+Labels below are how this report refers to each agent build; sections cross-reference them.
 
 | Label | Git / image | What was deployed | Where it appears |
 |---|---|---|---|
@@ -144,23 +144,23 @@ The control build reproduces the matrix agent (19.77 s vs **19.50 s** median on 
 | `exec` without `container=` on the two-container agent pod | HTTP 400; `dump.log` and artifact bytes missing from PageBroker results | Fixed in `run.py` |
 | One 14B writeback restore took 1677 s | Outlier during matrix | Excluded; capture arms unaffected |
 
-## 8. Capture bottlenecks and what to do (issue scope)
+## 8. Capture: where time went and ideas to discuss
 
-This section is the capture-side case for prioritizing the issue. Restore is out of scope here.
+Capture-only read of the measurements. Restore totals in §4 are for scale comparison, not analyzed here as bottlenecks.
 
-| Bottleneck | ~14B cost (evidence) | Optimizable? | Recommended action |
+| Phase / effect | ~14B (where we saw it) | How we read it | Possible direction (for discussion) |
 |---|---|---|---|
-| **Post-write kernel reap** | **~8 s**; ~0.15 s/GB; flat across storage (§4–§6) | **Yes — largest remaining win on direct path** | Return from capture before `wait4` / reap asynchronously; leave-running A/B proves bound (−8 s `criu_dump`) |
-| **Staged publish copy** | **~19 s** on stock **`e73a6112`**; **~20 s** PageBroker commit on **`a3cb9545`** (§4, §9) | **Yes — wiring, not new I/O** | Ship `PrepareDirectCheckpoint` (done on `exp/criu-capture-latency`, commit **`485f2671`**) |
-| **Image write (O_DIRECT)** | **~11 s** @ ~4.7 GB/s, matrix **direct · 96Gi** (§4) | Harder | Already near PVC throughput; wins need smaller images or faster storage, not more tuning on this node |
-| **`cuda_checkpoint`** | **~2.5–3.6 s** (matrix §4; **`e73a6112-direct`** §9) | Secondary | Optimize after reap and publish |
-| **Writeback + 4 Gi agent limit** | **+~9 s** vs direct at 14B (§4–§5) | Config | Default direct and/or size agent memory for buffered I/O |
+| **Post-write kernel reap** | **~8 s**; ~0.15 s/GB; flat across storage (§4–§6) | Dominates `criu_dump` after the image stops growing; leave-running diagnostic removed most of it | Whether capture completion can decouple from `wait4` / async reap (product + CRIU semantics) |
+| **Staged publish copy** | **~19 s** stock **`e73a6112`** (n=1); **~20 s** PageBroker commit on **`a3cb9545`** (§4, §9) | Extra copy, not CRIU write bandwidth | **`PrepareDirectCheckpoint`** — experiment patch on `exp/criu-capture-latency` (**`485f2671`**, **`e73a6112-direct`**) |
+| **Image write (O_DIRECT)** | **~11 s** @ ~4.7 GB/s, matrix **direct · 96Gi** (§4) | Near PVC throughput on this node | Bigger wins likely need less checkpointed bytes or different storage, not another `imageIoMode` toggle |
+| **`cuda_checkpoint`** | **~2.5–3.6 s** (matrix §4; **`e73a6112-direct`** §9) | Smaller than reap + write at 14B | Lower priority unless product goals say otherwise |
+| **Writeback + 4 Gi agent limit** | **+~9 s** vs direct at 14B (§4–§5) | Cgroup page-cache pressure | Agent memory sizing or defaulting direct for large checkpoints |
 
-**What not to chase for capture latency:** storage mode does not move the tail; GPU is already at 0 MiB before CRIU freeze (so the reap is not “holding the GPU” — it still blocks **snapshot ready**).
+**Observations that narrowed the search:** matrix runs did not show storage mode moving the post-write tail; GPU memory was at 0 MiB before CRIU freeze in our probe (reap still blocks **snapshot ready**, not necessarily the next GPU allocation).
 
-### Optional lever (workload, not snapshot)
+### Workload note (explore probe, not snapshot config)
 
-Engine RSS is mostly **4 KiB shmem memfd** (179 mappings, no THP). That matches heavy PTE work during teardown (~95 MiB `VmPTE`). **Action only if targeting faster reap without async exit:** larger shmem pages or fewer mappings in vLLM — not a CRIU knob.
+Engine RSS was mostly **4 KiB shmem memfd** (179 mappings, no THP), with ~95 MiB `VmPTE`. If someone wanted faster in-kernel teardown without changing when capture returns, that points at vLLM page layout — not a CRIU flag we tried.
 
 ## 9. Upstream follow-up: `e73a6112` vs `e73a6112-direct`
 
@@ -174,18 +174,18 @@ Same cluster node and workload as §2. Upgrade details and run IDs are in **Agen
 | Checkpoint total (agent summary) | — | 57.7 s | **24.2 s** |
 | Restore total (pod Ready, benchmark) | 36 s | 27 s | **25 s** |
 
-Stock **`e73a6112`** still called **`PrepareCheckpoint` (staged)** although PageBroker already exposes **`PrepareDirectCheckpoint`**. The **`e73a6112-direct`** image only changes that call site (branch `exp/criu-capture-latency`, commit **`485f2671`**). After direct prepare, **~21 s `criu_dump` remains**, so the scale-dependent capture issue still applies. Post-write tail was not re-run on `e73a6112`; expect the same reap class as §6 (matrix **`a3cb9545`**) until measured otherwise.
+Stock **`e73a6112`** still called **`PrepareCheckpoint` (staged)** although PageBroker already exposes **`PrepareDirectCheckpoint`**. The **`e73a6112-direct`** image only changes that call site (branch `exp/criu-capture-latency`, commit **`485f2671`**). In the one direct-prepare run, **~21 s `criu_dump` remained** after publish dropped — consistent with write + reap still dominating. We did not re-run the §6 tail sampler on `e73a6112`.
 
-## 10. Next steps (capture)
+## 10. Follow-ups to discuss (capture)
 
-1. **Product:** reap off the critical path (CRIU or agent lifecycle) — validates issue goal at scale.
-2. **Product:** merge and ship direct checkpoint prepare (already implemented on experiment branch).
-3. **Policy:** direct I/O + agent memory sizing for any writeback deployment.
-4. **Measure (optional):** repeat **`e73a6112-direct`** at 14B (n≥3) to firm medians; remeasure tail on `e73a6112` if stakeholders need parity with §6 (**`a3cb9545`**).
+- Reap vs snapshot readiness: is async teardown acceptable given CUDA / operator lifecycle?
+- **`PrepareDirectCheckpoint`**: worth upstreaming from `exp/criu-capture-latency` (**`485f2671`**) vs other publish designs?
+- Defaults for **`imageIoMode`** and agent memory when checkpoints are tens of GiB.
+- More runs: **`e73a6112-direct`** at 14B (n≥3); tail sampler on **`e73a6112`** if we want apples-to-apples with §6 (**`a3cb9545`**).
 
 ## 11. Caveats
 
-- Leave-running is **diagnostic only** (proves the reap bound; not a supported production mode).
+- Leave-running is **diagnostic only** (isolates the post-write window; not a supported production mode).
 - Tail and leave-running probes are n=1; the 8 s → 0.01 s delta is far outside run-to-run spread on `criu_dump`.
 - §4: agent git **`a3cb9545`**, three repeats per arm. §9: **`e73a6112`** and **`e73a6112-direct`**, one run each unless noted.
 - Explore sampler logs live under `benchmarks/results/explore-probe/` (local, not committed).
