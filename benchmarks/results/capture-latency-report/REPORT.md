@@ -63,23 +63,24 @@ A 14B dump on the shipped path, from full-debug `dump.log` timestamps:
 | Write rate | Image bytes ÷ write phase | Derived |
 | Post-write tail | `Unfreezing tasks` → `Writing stats`: image complete, CRIU not yet returned | `dump.log` markers |
 | Commit / `remove_old_version_and_switch` | Publish from staging to PVC, or rename when writing beside destination | Agent log phase |
+| Restore total | Restore pod created → readiness probe passes (benchmark); compare to capture wall time | Benchmark timestamps |
 
-## 4. Results by path (capture)
+## 4. Results by path (capture vs restore)
 
 ![14B capture time by path](1-phases-14b.png)
 
 Medians of 3 runs:
 
-| Arm | 0.6B criu | 0.6B rate | 14B criu | 14B write | 14B rate | 14B tail | 14B commit |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **direct · 96Gi** | 4.72 s | 2.19 GB/s | **19.50 s** | 10.8 s | 4.74 GB/s | 8.65 s | rename |
-| direct · 4Gi | 5.20 s | 2.06 GB/s | 20.18 s | 11.2 s | 4.57 GB/s | 8.81 s | rename |
-| writeback · 96Gi | 4.77 s | 2.19 GB/s | 22.58 s | 13.8 s | 3.71 GB/s | 8.61 s | rename |
-| writeback · 4Gi | 8.12 s | 1.13 GB/s | 31.80 s | 22.8 s | 2.24 GB/s | 8.82 s | rename |
-| PageBroker · direct | 7.01 s | 1.38 GB/s | 35.36 s | 26.6 s | 1.92 GB/s | 8.76 s | 20.2 s |
-| PageBroker · writeback | 7.01 s | 1.33 GB/s | 35.50 s | 26.4 s | 1.94 GB/s | 8.72 s | 20.2 s |
+| Arm | 0.6B criu | 0.6B rate | 14B criu | 14B write | 14B rate | 14B tail | 14B commit | 14B restore |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **direct · 96Gi** | 4.72 s | 2.19 GB/s | **19.50 s** | 10.8 s | 4.74 GB/s | 8.65 s | rename | 36 s |
+| direct · 4Gi | 5.20 s | 2.06 GB/s | 20.18 s | 11.2 s | 4.57 GB/s | 8.81 s | rename | — |
+| writeback · 96Gi | 4.77 s | 2.19 GB/s | 22.58 s | 13.8 s | 3.71 GB/s | 8.61 s | rename | 36 s |
+| writeback · 4Gi | 8.12 s | 1.13 GB/s | 31.80 s | 22.8 s | 2.24 GB/s | 8.82 s | rename | — |
+| PageBroker · direct | 7.01 s | 1.38 GB/s | 35.36 s | 26.6 s | 1.92 GB/s | 8.76 s | 20.2 s | 64 s |
+| PageBroker · writeback | 7.01 s | 1.33 GB/s | 35.50 s | 26.4 s | 1.94 GB/s | 8.72 s | 20.2 s | 63 s |
 
-The tail column comes from image-growth sampling; the `dump.log` equivalent is 7.95–8.00 s on every non-broker arm. **Takeaway:** tail and write behavior match across direct and writeback (at 96 Gi); broker adds slow staging plus ~20 s publish on this build.
+`14B criu` is agent `criu_dump` phase time (capture). `14B restore` is pod Ready after restore (includes vLLM wake), so it sits **above** agent restore phases — useful to see capture vs end-to-end restore scale, not to attribute restore bottlenecks (see §8). Tail column from image-growth sampling; `dump.log` equivalent 7.95–8.00 s on every non-broker arm. Restore totals for the 4Gi arms predate the current restore flow and are omitted.
 
 ## 5. Trends
 
@@ -88,7 +89,7 @@ The tail column comes from image-growth sampling; the `dump.log` equivalent is 7
 - **The tail is flat across every path** (8.6–8.8 s at 14B) and grows linearly with size at ~0.15 s/GB. No storage setting moves it.
 - **Direct I/O is limit-insensitive**: ~4.7 GB/s at 14B whether the agent has 4Gi or 96Gi.
 - **Writeback is limit-sensitive**: 2.24 GB/s at 4Gi vs 3.71 GB/s at 96Gi. Buffered writes charge page cache to the agent cgroup, and a 4Gi limit forces reclaim throughout a 51 GB dump.
-- **PageBroker roughly halves the write rate** on Oct‑5 (staging emptyDir vs O_DIRECT to PVC), then adds ~20 s publish — extra capture cost, not a faster path.
+- **PageBroker roughly halves the write rate** on Oct‑5 (staging emptyDir vs O_DIRECT to PVC), then adds ~20 s publish. Capture ~35 s and restore ~64 s at 14B vs ~20 s / ~36 s on direct — broker hurts both legs on this build.
 - **Small models write at ~2 GB/s on every path**: below ~10 GB, fixed per-dump overhead dominates.
 
 ## 6. Root cause of the tail
@@ -152,12 +153,13 @@ Engine RSS is mostly **4 KiB shmem memfd** (179 mappings, no THP). That matches 
 
 Matched operator + agent + PageBroker on one node (`imageIoMode: direct`, 96 Gi agent). PageBroker is mandatory on this revision.
 
-| Phase | Oct‑5 direct median (`criu_dump` focus) | HEAD before direct prepare | HEAD after direct prepare (n=1) |
+| Phase | Oct‑5 direct median | HEAD before direct prepare | HEAD after direct prepare (n=1) |
 |---|---:|---:|---:|
 | `cuda_checkpoint` | ~3.5 s | 3.6 s | 2.6 s |
 | `criu_dump` | 19.5 s | 34.8 s (wrote staging) | 21.2 s (beside destination) |
 | Publish (`remove_old_version_and_switch`) | rename | 18.8 s copy | **~1 ms** rename |
 | Checkpoint total (agent summary) | — | 57.7 s | **24.2 s** |
+| Restore total (pod Ready, benchmark) | 36 s | 27 s | **25 s** |
 
 HEAD’s default agent called **`PrepareCheckpoint` (staged)** even though the API already had **`PrepareDirectCheckpoint`**. Fixing the call site removes the copy; **~21 s `criu_dump` remains**, so the issue still applies. Post-write tail was not re-run on HEAD; expect the same reap class as §6 until measured otherwise.
 
