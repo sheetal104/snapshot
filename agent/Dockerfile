@@ -25,8 +25,8 @@ ARG GO_VERSION=1.26.6
 # args at build time, for example:
 #   --build-arg CRIU_REPO=<git-remote-url>
 #   --build-arg CRIU_REF=<fork-branch-or-sha>
-ARG CRIU_REPO=https://github.com/dfeigin-nv/criu.git
-ARG CRIU_REF=4675dcf3187dbdcea3afb2831e7487238ea214a2
+ARG CRIU_REPO=https://github.com/checkpoint-restore/criu.git
+ARG CRIU_REF=ee89da7d6d93ab9c5138bd32d596d3892a55c5d2
 ARG AGENT_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.11-cuda13.0-devel-ubuntu24.04@sha256:8315e2455736c4f9b597f15c5fb4d31f834e798e0c6b66bbdbdbac491ce26bd1
 ARG S3_RUNTIME_IMAGE=nvcr.io/nvidian/dynamo-dev/dynamo-vllm-placeholder:cs11584-lz4
 
