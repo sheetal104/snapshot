@@ -4,7 +4,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 OUT = "/home/shsriram/workspace/snapshot/benchmarks/results/capture-latency-report"
-SRC = "snapshot benchmarks · dynamo-aws-dev-02 · Oct 13–16 2026"
+SRC = "snapshot benchmarks · dynamo-aws-dev-02"
 BLUE, GREY, AMBER, RED = "#3b6fd8", "#9aa0a6", "#d9962b", "#c8453b"
 
 plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False})
@@ -49,7 +49,7 @@ ax.set_xlabel("Checkpoint image size (GB)")
 ax.set_ylabel("Unfreeze → Writing stats (s)")
 ax.set_title("Post-write tail grows linearly with image size")
 ax.legend(frameon=False)
-caption(fig, f"Oct 13 direct sweep, dump.log markers. {SRC}")
+caption(fig, f"Direct sweep, dump.log markers. {SRC}")
 fig.tight_layout(rect=(0, 0.04, 1, 1))
 fig.savefig(f"{OUT}/2-tail-vs-size.png", dpi=150)
 

@@ -11,8 +11,8 @@ sections = [
     (
         "CRIU capture latency: where the time goes",
         None,
-        "Notes from local runs on one GPU node with vLLM (Qwen3). Goal: see where capture "
-        "seconds go and what might be worth optimizing, not pick a single best storage setup.\n\n"
+        "Local runs on one GPU node with vLLM (Qwen3). The goal is to map where capture "
+        "seconds go and what may be worth optimizing, without selecting a single best storage setup.\n\n"
         "Issue: Reduce scale-dependent CRIU capture latency.",
     ),
     (
@@ -51,7 +51,7 @@ def main():
     t = doc.add_table(rows=1 + len(TABLE_GLANCE), cols=2)
     t.style = "Table Grid"
     hdr = t.rows[0].cells
-    hdr[0].text = "What we measured"
+    hdr[0].text = "Measurement"
     hdr[1].text = "Result"
     for i, (a, b) in enumerate(TABLE_GLANCE, start=1):
         t.rows[i].cells[0].text = a
@@ -98,13 +98,31 @@ def main():
             t3.rows[i].cells[j].text = val
 
     doc.add_heading("What looks worth optimizing", level=1)
-    for item in [
-        "Post-write reap (~8 s at 14B) on the baseline path",
-        "Staged publish copy (~19–20 s) before direct publish",
-        "Buffered I/O with a 4 Gi agent",
-        "CUDA checkpoint (~3 s), secondary",
-    ]:
-        doc.add_paragraph(item, style="List Bullet")
+    opt_sections = [
+        (
+            "1. Post-write reap (~8 s at 14B)",
+            "Problem: CRIU finishes writing the image (~11 s) but the dump RPC stays open ~8 s more. "
+            "Same tail on all baseline non-broker arms; scales ~0.15 s/GB. "
+            "Optimization: decouple snapshot-ready from engine reap (lifecycle), not disk tuning.",
+        ),
+        (
+            "2. Staged publish copy (~19–20 s)",
+            "Problem: full checkpoint copy after CRIU (PageBroker or staged prepare). "
+            "Optimization: direct write/rename (Trial 3b: ~58 s → ~24 s total in one run).",
+        ),
+        (
+            "3. Buffered I/O + 4 Gi agent",
+            "Problem: writeback without RAM slows the write phase (~32 s vs ~20 s direct). "
+            "Optimization: direct I/O or larger agent for writeback.",
+        ),
+        (
+            "4. CUDA checkpoint (~3 s)",
+            "Secondary vs reap, write, and publish copy.",
+        ),
+    ]
+    for title, body in opt_sections:
+        doc.add_heading(title, level=2)
+        doc.add_paragraph(body)
 
     out = DIR / "REPORT.docx"
     doc.save(out)
