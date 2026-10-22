@@ -95,10 +95,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN make -C criu-memory-provider clean all && make -C pagebroker daemon
 
-# The S3 provider POC uses the existing Model Streamer ABI for restore and
-# s5cmd for checkpoint upload. They are loaded only when PAGEBROKER_S3_MOVER
-# is configured.
-FROM ${S3_RUNTIME_IMAGE} AS s3-runtime
+# The S3 provider POC uses Model Streamer for restore when PAGEBROKER_S3_MOVER is
+# set. For capture-only trials (no S3), stub the library path so CI does not need
+# the internal nvcr.io/nvidian/... placeholder image.
+FROM ${AGENT_BASE_IMAGE} AS s3-runtime
+RUN mkdir -p /opt/dynamo/venv/lib/python3.12/site-packages/runai_model_streamer/libstreamer/lib \
+    && touch /opt/dynamo/venv/lib/python3.12/site-packages/runai_model_streamer/libstreamer/lib/libstreamer.so
 FROM peakcom/s5cmd:v2.3.0 AS s5cmd-runtime
 
 # =============================================================================
