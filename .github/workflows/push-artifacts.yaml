@@ -29,7 +29,7 @@ permissions: {}
 
 env:
   # Passed through to make, so the references we sign are the ones it pushed.
-  REGISTRY: ghcr.io/ai-dynamo/snapshot
+  REGISTRY: ghcr.io/sheetal104/snapshot
   # Layer cache, one tag per image. Not type=gha: the Actions cache is capped
   # at 10 GiB per repository and the Go module caches alone exceed that, so
   # buildx entries were evicted before any later run could read them and every
@@ -40,7 +40,7 @@ env:
   # Only this workflow writes it, and it runs on main and release branches
   # alone. A pull request that could write a shared cache could also poison
   # every build that reads it afterwards.
-  CACHE_REF_PREFIX: ghcr.io/ai-dynamo/snapshot/cache
+  CACHE_REF_PREFIX: ghcr.io/sheetal104/snapshot/cache
 
 jobs:
 
