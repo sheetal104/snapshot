@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -44,6 +45,10 @@ func (r *ContainerdRuntime) ResolveContainerImageID(ctx context.Context, contain
 	return resolveContainerImageID(ctx, r.cri, containerID)
 }
 
+func (r *ContainerdRuntime) ResolveContainerPodUID(ctx context.Context, containerID string) (string, error) {
+	return resolveContainerPodUID(ctx, r.cri, containerID)
+}
+
 func (r *ContainerdRuntime) TerminateContainer(ctx context.Context, containerID string) error {
 	id, err := containerIDForRuntime(containerID, "containerd://")
 	if err != nil {
@@ -53,6 +58,14 @@ func (r *ContainerdRuntime) TerminateContainer(ctx context.Context, containerID 
 		return fmt.Errorf("failed to terminate container %s: %w", containerID, err)
 	}
 	return nil
+}
+
+func (r *ContainerdRuntime) ExecSync(ctx context.Context, containerID string, cmd []string, timeout time.Duration) ([]byte, []byte, error) {
+	id, err := containerIDForRuntime(containerID, "containerd://")
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid containerd container ID %q: %w", containerID, err)
+	}
+	return r.cri.ExecSync(ctx, id, cmd, timeout)
 }
 
 func (r *ContainerdRuntime) ResolveContainer(ctx context.Context, containerID string) (int, *specs.Spec, error) {

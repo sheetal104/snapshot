@@ -1,8 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
+
+# The benchmark wrapper supplies these hooks. Normal guide runs need no helper files.
+phase = globals().get("benchmark_phase", lambda _: nullcontext())
+mark = globals().get("benchmark_mark", lambda _: None)
+benchmark_token = globals().get("benchmark_token")
+
 import asyncio
 import os
+import sys
+import json
 import traceback
 from pathlib import Path
 from uuid import uuid4
@@ -22,7 +31,6 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
 CONTROL_DIR = Path(os.environ.get("SNAPSHOT_CONTROL_DIR", "/snapshot-control"))
-MODEL = os.environ["SNAPSHOT_MODEL"]
 # Small single-GPU sizing so the example fits alongside other GPU tenants and
 # keeps the checkpoint artifact small. Override through the Pod template.
 MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "2048"))
@@ -39,19 +47,20 @@ async def generate_text(
     prompt: str,
     request_id: str,
 ) -> str:
-    result = None
-    async for output in engine.generate(
-        prompt,
-        SamplingParams(temperature=0.0, max_tokens=8),
-        request_id,
-    ):
-        result = output
-    if result is None or not result.outputs:
-        raise RuntimeError("vLLM produced no output")
-    text = result.outputs[0].text.strip()
-    if not text:
-        raise RuntimeError("vLLM produced empty output")
-    return text
+    with phase("generation"):
+        result = None
+        async for output in engine.generate(
+            prompt,
+            SamplingParams(temperature=0.0, max_tokens=8),
+            request_id,
+        ):
+            result = output
+        if result is None or not result.outputs:
+            raise RuntimeError("vLLM produced no output")
+        text = result.outputs[0].text.strip()
+        if not text:
+            raise RuntimeError("vLLM produced empty output")
+        return text
 
 
 async def serve_api(engine: AsyncLLM, restored_text: str) -> None:
@@ -64,7 +73,10 @@ async def serve_api(engine: AsyncLLM, restored_text: str) -> None:
             request.prompt,
             f"request-{uuid4().hex}",
         )
-        return {"text": text}
+        return {
+            "text": text,
+            **({"checkpoint_token": benchmark_token} if benchmark_token else {}),
+        }
 
     server = uvicorn.Server(
         uvicorn.Config(
@@ -91,16 +103,21 @@ async def serve_api(engine: AsyncLLM, restored_text: str) -> None:
 async def main() -> None:
     CONTROL_DIR.joinpath("ready-for-snapshot").unlink(missing_ok=True)
 
+    engine_args = {
+        "max_model_len": MAX_MODEL_LEN,
+        "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
+        "trust_remote_code": TRUST_REMOTE_CODE,
+        # JSON keys are AsyncEngineArgs API keyword arguments, not CLI flags.
+        **json.loads(sys.argv[1]),
+        # Capture releases KV through sleep mode.
+        "enable_sleep_mode": True,
+    }
+    mark("engine_init_begin")
     engine = AsyncLLM.from_engine_args(
-        AsyncEngineArgs(
-            model=MODEL,
-            enable_sleep_mode=True,
-            max_model_len=MAX_MODEL_LEN,
-            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-            trust_remote_code=TRUST_REMOTE_CODE,
-        ),
+        AsyncEngineArgs(**engine_args),
         usage_context=UsageContext.LLM_CLASS,
     )
+    mark("engine_init_end")
 
     text = await generate_text(
         engine,
@@ -108,9 +125,26 @@ async def main() -> None:
         "snapshot-preflight",
     )
     print(f"vLLM pre-checkpoint output={text!r}", flush=True)
+    mark("first_inference_complete")
+    if benchmark_token:
+        for prompt, expected in [
+            ("The capital city of France is", "paris"),
+            ("The capital city of Germany is", "berlin"),
+            ("The capital city of Japan is", "tokyo"),
+        ]:
+            answer = await generate_text(engine, prompt, "precheck-" + expected)
+            print(
+                "CR_SEMANTIC_PRECHECK "
+                + json.dumps(dict(expected=expected, answer=answer)),
+                flush=True,
+            )
+            if expected not in answer.lower():
+                raise RuntimeError("Source inference check failed: " + repr(answer))
 
-    await engine.pause_generation()
-    await engine.sleep()
+    with phase("pause_generation"):
+        await engine.pause_generation()
+    with phase("release_kv_cache"):
+        await engine.release_kv_cache_memory()
     CONTROL_DIR.joinpath("ready-for-snapshot").write_text(
         "ready\n",
         encoding="utf-8",
@@ -118,14 +152,16 @@ async def main() -> None:
 
     while True:
         if CONTROL_DIR.joinpath("restore-complete").exists():
-            # The restored process keeps the source container's stdout, which
-            # is gone; a failure here would otherwise be invisible. Record it
-            # in the control directory next to the success sentinel.
+            # The restore connects this process's output to the restore
+            # container's log. Also record a failure in the control directory,
+            # next to the success sentinel, where tools can read it.
             try:
                 progress = CONTROL_DIR.joinpath("vllm-restore-progress")
-                await engine.wake_up()
+                with phase("wake"):
+                    await engine.wake_up()
                 progress.write_text("woken\n", encoding="utf-8")
-                await engine.resume_generation()
+                with phase("resume_generation"):
+                    await engine.resume_generation()
                 await engine.check_health()
                 progress.write_text("generation-resumed\n", encoding="utf-8")
                 text = await generate_text(

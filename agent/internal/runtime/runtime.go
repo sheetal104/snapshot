@@ -39,10 +39,18 @@ type Runtime interface {
 	ResolveContainerIDByPod(ctx context.Context, pod, ns, ctr string) (string, error)
 	ResolveContainerByPod(ctx context.Context, pod, ns, ctr string) (int, *specs.Spec, error)
 	ResolveContainerImageID(ctx context.Context, id string) (string, error)
+	// ResolveContainerPodUID returns the UID of the container's Pod on the
+	// node, which names the Pod's directories under kubelet's.
+	ResolveContainerPodUID(ctx context.Context, id string) (string, error)
 	// TerminateContainer requests zero-grace termination through CRI using the
 	// runtime container ID. Implementations validate any supplied runtime scheme
 	// before dispatch.
 	TerminateContainer(ctx context.Context, id string) error
+	// ExecSync runs cmd in the container through CRI, the way kubelet runs an
+	// exec probe: as the container's user, with its capabilities, seccomp and
+	// LSM profile, inside its mounts. A non-zero exit is an error with an
+	// ExitStatus method; a timeout wraps remote.ErrCommandTimedOut.
+	ExecSync(ctx context.Context, id string, cmd []string, timeout time.Duration) (stdout, stderr []byte, err error)
 	Close() error
 }
 

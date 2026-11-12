@@ -48,13 +48,12 @@ new replica comes online in seconds instead of minutes.
 
 <div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/development/img/cold-start-vs-snapshot-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="docs/development/img/cold-start-vs-snapshot-light.svg">
-    <img width="900" alt="Paired column chart comparing cold start against Snapshot for each model. Cold start ranges from 52 to 102 seconds, Snapshot from 3.5 to 40.9 seconds." src="docs/development/img/cold-start-vs-snapshot-light.svg">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/development/img/vllm-cold-start-vs-snapshot-dark.png">
+    <img width="900" alt="Cold start and Snapshot restore for vLLM on a single B200 node, using one to eight GPUs." src="docs/development/img/vllm-cold-start-vs-snapshot.png">
   </picture>
 </div>
 
-<p align="center"><i><b>Figure 1.</b> Restoring a captured workload is 2.4 to 14.9 times faster than starting the same workload from scratch on the same hardware.</i></p>
+<p align="center"><i><b>Figure 1.</b> Cold start and Snapshot restore for vLLM on a single B200 node, using one to eight GPUs.</i></p>
 
 For the experiment setup, the per stage breakdown, and the full results, see [benchmarks](docs/development/benchmarks.md).
 
@@ -85,10 +84,13 @@ Before installing Snapshot, make sure the following are in place:
 
 - A Kubernetes cluster with NVIDIA GPU nodes running Linux kernel 5.13 or newer
 - containerd or CRI-O as the container runtime
-- [NVIDIA GPU Operator](https://github.com/NVIDIA/gpu-operator) 26.3 or newer, with CUDA driver 580 or newer and MIG disabled
-- A `ReadWriteMany` (RWX) storage class
+- [NVIDIA GPU Operator](https://github.com/NVIDIA/gpu-operator) 26.3 or newer, with MIG disabled
+- NVIDIA kernel-mode driver 580 or newer
+- A shared snapshot store: an RWX storage class or an S3 bucket — see [Storage](docs/operations/storage.md)
 - The [Helm](https://helm.sh/docs/intro/install) CLI
 - A cluster that permits privileged pods for the node agent — see [Security](docs/operations/security.md)
+
+Some features raise this floor — see [Compatibility](docs/reference/compatibility.md).
 
 ## Installation
 
@@ -108,11 +110,11 @@ for other versions):
 
 ```bash
 helm install snapshot oci://ghcr.io/ai-dynamo/snapshot/snapshot \
-  --version 0.1.0 \
+  --version 0.3.0 \
   --namespace snapshot --create-namespace
 ```
 
-By default the chart provisions its own RWX checkpoint volume, shared by every
+By default the chart provisions its own RWX snapshot volume, shared by every
 checkpoint. See [Storage](docs/operations/storage.md) for the volume model and options
 (including reusing an existing claim), and [Installation](docs/operations/install.md)
 for install and uninstall.
@@ -136,23 +138,22 @@ primitives into their own control loop.
 | `nvidia.com/restore-from` | Namespaced | Pod annotation that triggers a restore from a named `PodSnapshot` in the same namespace. |
 
 Under the hood, a control-plane operator and a per-node agent perform the CRIU
-and `cuda-checkpoint` work; see [Architecture](docs/reference/architecture.md).
+and `cuda-checkpoint` work; see [Architecture](docs/reference/architecture/).
 The [API reference](docs/reference/api.md) covers the resources and the
 checkpoint/restore lifecycle.
 
 Once Snapshot is installed, follow the **[usage guides](docs/guides/README.md)**
-to checkpoint and restore a pod.
+from a workload to a restored replica: pick an inference framework and model on
+one or eight GPUs, make the workload snapshot-ready, checkpoint it, and restore it.
 
 ## Limitations
 
 Current limitations:
 
-- Single-GPU workloads only.
-- x86_64 nodes only.
+- Linux nodes on x86_64 or arm64.
+- Workloads, including multi-GPU workloads, must run on a single node. Multi-node is on the roadmap.
 - vGPU is not supported.
 - Runs only on NVIDIA GPUs supported by the required CUDA driver.
-
-Multi-GPU and Arm support are on the roadmap.
 
 ## Documentation
 
@@ -166,15 +167,18 @@ operations, indexed below.
 **Reference**
 
 - [API](docs/reference/api.md) — `PodSnapshot`, `PodSnapshotContent`, `SnapshotJob`, and the `restore-from` annotation.
-- [Architecture](docs/reference/architecture.md) — operator and node-agent design, and the checkpoint/restore internals.
+- [Architecture](docs/reference/architecture/) — operator and node-agent design, the checkpoint/restore internals, and multi-GPU support.
 - [CLI (`snapshotctl`)](docs/reference/cli.md) — lower-level checkpoint/restore from a pod manifest.
 - [Workload contract](docs/reference/workload-contract.md) — what a workload must do, and how its pod must be shaped, to be checkpointed and restored; a custom image is one packaging method.
 - [Restore Pod contract](docs/reference/restore-pod-contract.md) — the pod interface for programmatic restore: annotations, control volume, startup gate, and seccomp.
+- [Compatibility](docs/reference/compatibility.md) — minimum GPU driver and other dependency versions, per feature.
 
 **Operations**
 
 - [Installation](docs/operations/install.md) — Helm install and uninstall.
-- [Storage](docs/operations/storage.md) — the shared checkpoint volume and how to configure it.
+- [Storage](docs/operations/storage.md) — the shared snapshot volume and how to configure it.
+- [Storage best practices](docs/operations/storage/README.md) — backend tuning and examples.
+- [Why is my restore slow?](docs/operations/storage/slow-restore.md) — check timings, NFS clients, mount options, and fio results.
 - [Troubleshooting](docs/operations/troubleshooting.md) — common failures and where to look.
 - [Security](docs/operations/security.md) — the privileged agent, seccomp, and Pod Security.
 
@@ -182,6 +186,8 @@ operations, indexed below.
 
 - [Building from source](docs/development/build-from-source.md) — build the images and install locally.
 - [Benchmarks](docs/development/benchmarks.md) — how startup performance is measured.
+- [Writing documentation](docs/development/writing-docs.md) — where a change goes and how to write it.
+- [Naming conventions](docs/development/naming.md) — terms and naming patterns for the API, chart, and docs.
 
 **More**
 

@@ -13,17 +13,20 @@ This chart installs the snapshot infrastructure:
 - the seccomp profile CRIU needs
 
 Install one Snapshot release for the cluster. Every node agent mounts the same
-shared checkpoint PVC directly and watches checkpoint/restore pods in all
-namespaces. Workload pods never mount checkpoint storage.
+shared snapshot volume directly and watches checkpoint and restore pods in all
+namespaces. Snapshot does not mount the store into workload pods; a non-target
+artifact writer mounts it itself.
 
 ## Prerequisites
 
-- Kubernetes cluster with x86_64 GPU nodes
-- NVIDIA GPU Operator 26.3 or newer, with NVIDIA driver 580.xx or newer
+- Kubernetes cluster with x86_64 or arm64 GPU nodes
+- NVIDIA GPU Operator 26.3 or newer
+- NVIDIA kernel-mode driver 580 or newer. Some features depend on the user-mode
+  driver version; see [Compatibility](../../docs/reference/compatibility.md)
 - **containerd** or **CRI-O** (chart defaults to containerd; see below for CRI-O / OpenShift)
 - a cluster where a privileged DaemonSet with `hostPID`, `hostIPC`, and `hostNetwork` is acceptable
 
-The checkpoint PVC must support `ReadWriteMany` because agents on multiple nodes
+The snapshot volume must support `ReadWriteMany` because agents on multiple nodes
 mount it concurrently. Chart-created claims always request `ReadWriteMany` and
 are retained when the Helm release is removed.
 
@@ -52,7 +55,7 @@ release that uses a private agent image, set the private registry pull secret in
 the same Helm upgrade so the new chart defaults do not remove the required image
 access.
 
-Create a checkpoint PVC through an RWX-capable StorageClass, such as an EFS
+Create a snapshot volume through an RWX-capable StorageClass, such as an EFS
 StorageClass:
 
 ```bash
@@ -100,7 +103,7 @@ inside the agent's mount namespace — it is not a relocatable prefix.
 
 ## Minimal install
 
-Create the checkpoint PVC and the agent:
+Create the snapshot volume and the agent:
 
 ```bash
 helm upgrade --install snapshot ./charts/snapshot \
@@ -185,21 +188,38 @@ kubectl get pods -n ${NAMESPACE} -l app.kubernetes.io/name=snapshot -o wide
 | `pageBroker.transferChunkBytes` | Bytes per transfer slot | `134217728` |
 | `pageBroker.maxPinnedBytes` | Total pinned memory limit, including allocation rounding. Zero sets no limit | `0` |
 | `daemonset.imagePullSecrets` | Pull secrets for a private agent image override | `[]` |
+| `daemonset.affinity` | Affinity for the agent pod. The chart adds `kubernetes.io/arch In (amd64, arm64)` to every non-empty required node selector term, so a term with `example.com/pool DoesNotExist` keeps the agent off those nodes on supported architectures. Empty and null terms still match no nodes | `{}` |
 | `daemonset.runtimeClassName` | RuntimeClass for the agent pod. Set `""` to omit it when the NVIDIA runtime is containerd's default and no `nvidia` RuntimeClass exists | `nvidia` |
-| `operator.resources` | CPU and memory requests/limits for the operator manager | 50m CPU / 64Mi request, 500m CPU / 128Mi limit |
+| `operator.resources` | CPU and memory requests/limits for the operator manager | 50m CPU / 64Mi request, 500m CPU / 256Mi limit |
+| `operator.bindNewContents` | Bind new snapshots to the configured store. Enable after all agents have completed the compatible artifact-backend rollout; see [storage activation](../../docs/operations/storage.md#enable-artifact-addressing). Required for `storage.type: s3` | `false` |
 | `operator.nodeSelector` | Node selector for the operator pod | `{}` |
 | `operator.affinity` | Affinity rules for the operator pod | `{}` |
 | `operator.tolerations` | Tolerations for the operator pod | `[]` |
 | `storage.type` | Snapshot-owned storage backend | `pvc` |
 | `storage.pvc.create` | Create `snapshot-pvc` instead of using an existing shared PVC | `true` |
-| `storage.pvc.name` | Shared RWX checkpoint PVC mounted by every agent | `snapshot-pvc` |
+| `storage.pvc.name` | Shared RWX snapshot volume mounted by every agent | `snapshot-pvc` |
 | `storage.pvc.size` | Requested PVC size | `1Ti` |
 | `storage.pvc.storageClass` | Storage class name | `""` |
 | `storage.pvc.basePath` | Fixed checkpoint mount path enforced by the privileged helper | `/checkpoints` |
-| `pageBroker.staging.sizeLimit` | Cap on the memory-backed staging volume shared by the agent and PageBroker, used for checkpoint (except GPU CustomStorage capture) and staged restore. Leave headroom above it in the writing container's memory limit; the chart's 64Gi default and the agent's 64Gi default memory limit leave none | `64Gi` |
+| `storage.s3.endpoint` | S3-compatible endpoint, an absolute http(s) URL, with `storage.type=s3` | `""` |
+| `storage.s3.region` | Bucket region | `""` |
+| `storage.s3.bucket` | Bucket holding the checkpoints | `""` |
+| `storage.s3.prefix` | Key prefix inside the bucket; empty is the bucket root | `""` |
+| `storage.s3.credentialsSecretRef` | Secret holding a shared-credentials file, mounted into PageBroker and the operator | `""` |
+| `storage.s3.credentialsSecretKey` | Key in that Secret holding the credentials file | `credentials` |
+| `storage.s3.addressing` | Bucket addressing PageBroker uses: `virtual` (its default when empty) or `path` | `""` |
+| `storage.s3.allowHttp` | Accept a plain-http endpoint | `false` |
+| `storage.s3.caBundleConfigMapRef` | ConfigMap holding the CA bundle for the endpoint's TLS certificate, mounted into PageBroker and the operator | `""` |
+| `storage.s3.caBundleConfigMapKey` | Key in that ConfigMap holding the bundle | `ca.crt` |
+| `pageBroker.staging.sizeLimit` | Cap on the memory-backed staging volume shared by the agent and PageBroker, used for a checkpoint (except GPU CustomStorage) and a staged restore. The chart lowers a value that leaves the writing container no headroom; see [How the cap is chosen](../../docs/operations/storage.md#how-the-cap-is-chosen) | `56Gi` |
 | `pageBroker.maxConcurrentRequests` | Concurrent control-socket requests the daemon serves | `16` |
+| `pageBroker.artifactAddressing` | Pass store configuration to a compatible PVC artifact backend. Deploy this before enabling `operator.bindNewContents` | `false` |
+| `pageBroker.s3.limits` | PageBroker's S3 transfer and transaction limits, passed through as its `limits` object; `stagingBytes` defaults to the staging cap | `{}` |
+| `pageBroker.transferEngine.modelStreamer` | Model Streamer reader tuning for S3 restores, passed through as the file behind `--model-streamer-config` | `{}` |
+| `pageBroker.transferEngine.modelStreamer.restoreBatchBytes` | S3 restore batch and shared admission budget in bytes; an oversized file runs alone. Does not cap total staging memory | `10000000000` |
+| `pageBroker.transferEngine.modelStreamer.restorePreparationSlots` | Retained batches per S3 restore, including preparation in progress; 1–20. Does not increase native download admission limits | `3` |
 | `pageBroker.resources` | CPU and memory requests/limits for the PageBroker sidecar. The memory limit bounds restore prefetch into staging | 8 CPU / 32Gi request, 32 CPU / 256Gi limit |
-| `daemonset.resources` | CPU and memory requests/limits for the agent. The agent's memory limit also bounds the largest checkpoint image, because CRIU writes it into memory-backed PageBroker staging (direct GPU CustomStorage capture writes to the PVC instead, and is not bound by this) | 2 CPU / 1Gi request, 4 CPU / 64Gi limit |
+| `daemonset.resources` | CPU and memory requests/limits for the agent. The agent's memory limit also bounds the largest CRIU image, because CRIU writes it into memory-backed PageBroker staging (a direct GPU CustomStorage checkpoint writes to the PVC instead, and is not bound by this) | 2 CPU / 1Gi request, 4 CPU / 64Gi limit |
 | `seccomp.deploy` | Deploy the CRIU seccomp profile ConfigMap and init container. Use this field name; `seccomp.enabled` is not a chart value | `true` |
 | `runtime.type` | CRI backend: `containerd` or `crio` | `containerd` |
 | `runtime.socketPath` | CRI socket (empty = default for `runtime.type`) | `""` |
@@ -209,12 +229,16 @@ kubectl get pods -n ${NAMESPACE} -l app.kubernetes.io/name=snapshot -o wide
 | `rbac.create` | Create agent and operator RBAC | `true` |
 | `openshift.enabled` | Create required-SCC pod annotations and, when `rbac.create=true`, OpenShift SCC-use RBAC | `false` |
 
-Reserved `s3` and `oci` values remain chart-owned placeholders for future
-snapshot backends, but only `pvc` is implemented today.
+`storage.type` supports `pvc` and `s3`. `oci` remains a chart-owned placeholder
+for a future backend and is not implemented today. See
+[Storage](../../docs/operations/storage.md#other-backends) for the S3 settings
+PageBroker reads.
 
-PageBroker handles every capture and restore. GPU capture uses CustomStorage
-when the driver supports it, otherwise it uses the driver-managed format.
-Restore follows the saved artifact format.
+Filesystem checkpoint and restore use POSIX.
+
+PageBroker handles every checkpoint and restore. A GPU checkpoint uses
+CustomStorage when the driver supports it, otherwise it uses the
+driver-managed format. Restore follows the saved snapshot format.
 
 PageBroker adds an 8 CPU and 32 GiB memory request to each agent pod. A node
 must have this capacity plus the agent's own request, or the pod stays Pending.
@@ -223,6 +247,13 @@ GPU, or 32 GiB on an eight-GPU node, plus overhead. A lower resource request
 does not reduce this allocation. Set the memory limit to cover the rings,
 process memory, and CPU staging. See the
 [engine design](../../docs/proposals/238-pagebroker-gpu-engine/README.md).
+
+The existing `storage.pvc` values and release namespace also produce the resolved
+`storage.yaml` configuration mounted into the operator and PageBroker. The agent
+retains its existing `config.yaml` without a PVC identity block. Store identity
+uses the claim-relative root `/`, not `storage.pvc.basePath`'s `/checkpoints` mount
+path. No new storage-selection values or storage-class CRD are introduced; see
+[storage configuration](../../docs/operations/storage.md#configuration).
 
 See [values.yaml](./values.yaml) for the full configuration surface.
 

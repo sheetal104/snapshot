@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -42,8 +43,11 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/ai-dynamo/snapshot/agent/internal/cuda"
 	"github.com/ai-dynamo/snapshot/agent/internal/executor"
+	"github.com/ai-dynamo/snapshot/agent/internal/lifecyclehooks"
 	"github.com/ai-dynamo/snapshot/agent/internal/nsmount"
+	"github.com/ai-dynamo/snapshot/agent/internal/pagebroker"
 	snapshotruntime "github.com/ai-dynamo/snapshot/agent/internal/runtime"
 	"github.com/ai-dynamo/snapshot/agent/internal/types"
 	"github.com/ai-dynamo/snapshot/api/compat"
@@ -55,27 +59,56 @@ import (
 // snapshot execution for checkpoint and restore requests. Both paths are workqueue
 // driven, with typed reads/writes via an uncached controller-runtime client.
 type NodeController struct {
-	config                  *types.AgentConfig
-	clientset               kubernetes.Interface
-	client                  client.Client
-	dynClient               dynamic.Interface
-	runtime                 snapshotruntime.Runtime
-	injector                executor.RestoreMounter
-	log                     logr.Logger
-	checkpointFn            func(ctx context.Context, params CheckpointParams) error
-	restoreFn               func(context.Context, snapshotruntime.Runtime, logr.Logger, executor.RestoreRequest, executor.RestoreMounter) (executor.RestoreResult, error)
-	writeControlSentinelFn  func(int, string, []byte) error
-	controlSentinelExistsFn func(int, string) (bool, error)
-	sendSignalFn            func(logr.Logger, int, syscall.Signal, string) error
-	restoreQueue            workqueue.TypedDelayingInterface[client.ObjectKey]
-	restorePodLister        corev1listers.PodLister
-	compareFn               func(compat.Gate, compat.Environment, compat.Environment) []compat.Mismatch
+	config                    *types.AgentConfig
+	clientset                 kubernetes.Interface
+	client                    client.Client
+	dynClient                 dynamic.Interface
+	runtime                   snapshotruntime.Runtime
+	injector                  executor.RestoreMounter
+	log                       logr.Logger
+	checkpointFn              func(ctx context.Context, params CheckpointParams) (*pagebroker.PublishedArtifact, error)
+	fetchManifestFn           func(ctx context.Context, artifact *pagebroker.PublishedArtifact) (*types.CheckpointManifest, error)
+	restoreFn                 func(context.Context, snapshotruntime.Runtime, logr.Logger, executor.RestoreRequest, executor.RestoreMounter) (executor.RestoreResult, error)
+	writeControlSentinelFn    func(int, string, []byte) error
+	writePodControlSentinelFn func(string, string, string, []byte) error
+	controlSentinelExistsFn   func(int, string) (bool, error)
+	sendSignalFn              func(logr.Logger, int, syscall.Signal, string) error
+	// hostProcPath is where the agent reads the node's processes; tests point it elsewhere.
+	hostProcPath         string
+	stagingCapacityFn    func(string) (int64, error)
+	minimumImageSizeFn   func(string, []int) (int64, error)
+	reviveGPUProcessesFn func(context.Context, []int, string, logr.Logger) error
+	restoreQueue         workqueue.TypedDelayingInterface[client.ObjectKey]
+	restorePodLister     corev1listers.PodLister
+	compareFn            func(compat.Gate, compat.Environment, compat.Environment) []compat.Mismatch
+	withoutProxy         bool
 
 	// captureQueue holds PodSnapshotContent names. Its per-key exclusion is the capture path's only
 	// lock, which is enough because exactly one agent runs per node.
 	captureQueue workqueue.TypedRateLimitingInterface[string]
 
+	// checkpointGates holds a *checkpointGate per work order, while the agent waits for its
+	// source container to be ready for the checkpoint.
+	checkpointGates sync.Map
+	// hookExec runs a lifecycle hook's file action in its container, and
+	// hookHTTP sends its HTTP requests. Tests replace them.
+	hookExec lifecyclehooks.Execer
+	hookHTTP *http.Client
+	// nowFn and requeueCaptureFn are time.Now and captureQueue.AddAfter. Tests
+	// replace them.
+	nowFn            func() time.Time
+	requeueCaptureFn func(name string, after time.Duration)
+
+	// postRestoreWaitFn waits between post-restore attempts: waitOrDone.
+	// Tests replace it.
+	postRestoreWaitFn func(ctx context.Context, d time.Duration) error
+
 	handledRestores sync.Map
+
+	// startedRestoreContainers holds, per restoreContainerKey, the ID of a
+	// restore destination container the NRI plugin saw start, so a restore
+	// begins before kubelet publishes the container in the Pod status.
+	startedRestoreContainers sync.Map
 
 	// contentIndexer is the PodSnapshotContent informer's indexer, indexed by source pod
 	// (podRefIndex). The source-pod informer uses it to map a pod event back to its work order.
@@ -89,6 +122,8 @@ type restoreArtifact struct {
 	ContentUID          string
 	SourceContainerName string
 	Path                string
+	// PublishedArtifact is set only for bound content, read from status.
+	PublishedArtifact *pagebroker.PublishedArtifact
 }
 
 type restoreTarget struct {
@@ -102,6 +137,11 @@ type restorePlan struct {
 	mappings []podcontract.ContainerMapping
 	// Read once in preflight, so both gates reach the same answer.
 	skipCompatCheck bool
+	// postRestore runs the checkpoint's lifecycle.postRestore action, every
+	// postRestorePeriod until it succeeds; nil without an action. The
+	// preflight already checked it against the destination containers.
+	postRestore       postRestoreHandler
+	postRestorePeriod time.Duration
 }
 
 type restoreResultState int
@@ -130,20 +170,23 @@ func (e *restorePendingError) Error() string {
 }
 
 type restoreOperation struct {
-	controller      *NodeController
-	pod             *corev1.Pod
-	artifact        *restoreArtifact
-	skipCompatCheck bool
-	destination     string
-	containerID     string
-	startedAt       time.Time
-	log             logr.Logger
+	controller        *NodeController
+	pod               *corev1.Pod
+	artifact          *restoreArtifact
+	postRestore       postRestoreHandler
+	postRestorePeriod time.Duration
+	skipCompatCheck   bool
+	destination       string
+	containerID       string
+	startedAt         time.Time
+	log               logr.Logger
 }
 
 const (
 	containerResolveAttemptTimeout     = 1 * time.Second
 	restoreContainerResolveInterval    = 50 * time.Millisecond
 	restoreContainerResolveTimeout     = 30 * time.Second
+	restorePreflightManifestTimeout    = 30 * time.Second
 	restoreAlreadyCompletedReason      = "RestoreAlreadyCompleted"
 	restoreAlreadyPartialReason        = "RestoreAlreadyPartiallySucceeded"
 	restoreAlreadyFailedReason         = "RestoreAlreadyFailed"
@@ -159,6 +202,10 @@ const (
 	// snapshotContentResyncInterval re-drives every PodSnapshotContent work order so a
 	// not-yet-Ready source pod is re-checked for quiesce without a busy loop.
 	snapshotContentResyncInterval = 10 * time.Second
+
+	// waitingForCheckpointReadinessReason is the Event on the source Pod when
+	// the agent starts waiting for its checkpoint readiness probe.
+	waitingForCheckpointReadinessReason = "WaitingForCheckpointReadiness"
 )
 
 // podSnapshotContentGVR is the cluster-scoped resource the capture informer watches.
@@ -228,14 +275,33 @@ func newDefaultController(
 			workqueue.TypedRateLimitingQueueConfig[string]{Name: "capture-contents"},
 		),
 
-		restoreFn:               executor.Restore,
-		writeControlSentinelFn:  snapshotruntime.WriteControlSentinel,
-		controlSentinelExistsFn: snapshotruntime.ControlSentinelExists,
-		sendSignalFn:            snapshotruntime.SendSignalToPID,
-		compareFn:               compat.Compare,
+		restoreFn:                 executor.Restore,
+		writeControlSentinelFn:    snapshotruntime.WriteControlSentinel,
+		writePodControlSentinelFn: snapshotruntime.WritePodControlSentinel,
+		controlSentinelExistsFn:   snapshotruntime.ControlSentinelExists,
+		sendSignalFn:              snapshotruntime.SendSignalToPID,
+		hostProcPath:              snapshotruntime.HostProcPath,
+		stagingCapacityFn:         snapshotruntime.StagingCapacity,
+		minimumImageSizeFn:        snapshotruntime.MinimumImageSize,
+		reviveGPUProcessesFn:      cuda.ReviveProcessTree,
+		compareFn:                 compat.Compare,
+		hookExec:                  rt,
+		hookHTTP:                  lifecyclehooks.NewHTTPClient(),
+		nowFn:                     time.Now,
+		postRestoreWaitFn:         waitOrDone,
 	}
+	w.requeueCaptureFn = w.captureQueue.AddAfter
 	w.checkpointFn = w.executorCheckpoint
+	w.fetchManifestFn = func(ctx context.Context, artifact *pagebroker.PublishedArtifact) (*types.CheckpointManifest, error) {
+		return executor.FetchArtifactManifest(ctx, cfg.PageBroker.ControlSocketPath, artifact)
+	}
 	return w
+}
+
+// RestoreWithoutProxy makes restores run without the restore proxy, on a node
+// whose runtime cannot run it. Call it before Run.
+func (w *NodeController) RestoreWithoutProxy() {
+	w.withoutProxy = true
 }
 
 // Run starts the local pod informers and processes checkpoint/restore events.
@@ -380,6 +446,35 @@ func (w *NodeController) forgetRestorePod(obj interface{}) {
 		return
 	}
 	w.handledRestores.Delete(string(pod.UID))
+	prefix := string(pod.UID) + "/"
+	w.startedRestoreContainers.Range(func(key, _ any) bool {
+		if strings.HasPrefix(key.(string), prefix) {
+			w.startedRestoreContainers.Delete(key)
+		}
+		return true
+	})
+}
+
+// RestoreContainerStarted records a restore destination's container that the
+// NRI plugin saw start, and requeues its Pod so the restore begins without
+// waiting for kubelet to publish the container in the Pod status. In a
+// vCluster tenant that status is also the only other way to find the
+// container: the runtime labels it with the host Pod's name.
+func (w *NodeController) RestoreContainerStarted(pod ktypes.NamespacedName, uid ktypes.UID, container, containerID string) {
+	w.startedRestoreContainers.Store(restoreContainerKey(uid, container), containerID)
+	w.restoreQueue.Add(pod)
+}
+
+// RestoreContainerStopped forgets a reported destination container that has
+// stopped, unless a later container already replaced the report. A restore
+// into it would fail the Pod's restore instead of waiting for the container
+// kubelet starts next.
+func (w *NodeController) RestoreContainerStopped(uid ktypes.UID, container, containerID string) {
+	w.startedRestoreContainers.CompareAndDelete(restoreContainerKey(uid, container), containerID)
+}
+
+func restoreContainerKey(uid ktypes.UID, container string) string {
+	return string(uid) + "/" + container
 }
 
 func (w *NodeController) restorePodRequested(pod *corev1.Pod) bool {
@@ -418,6 +513,11 @@ func (w *NodeController) processRestoreQueueItem(ctx context.Context, key client
 			w.restoreQueue.AddAfter(key, restoreSafetyRequeueInterval)
 		}
 	}()
+	// Registered after the Done defer so it runs first, leaving requeue false.
+	var panicked *corev1.Pod
+	defer recoverPanic(w.log, "restore work order", func(err error) {
+		w.failRestoreAfterPanic(ctx, key, panicked, err)
+	}, "pod", key.String())
 
 	pod, err := w.restorePodLister.Pods(key.Namespace).Get(key.Name)
 	if apierrors.IsNotFound(err) {
@@ -429,6 +529,7 @@ func (w *NodeController) processRestoreQueueItem(ctx context.Context, key client
 		return
 	}
 	pod = pod.DeepCopy()
+	panicked = pod
 	if w.skipRequestedAfterRefusal(pod) {
 		// The skip request is the way back for a pod the gates turned down, so
 		// it has to clear the in-process marker as well as the condition below.
@@ -517,7 +618,7 @@ func (w *NodeController) preflightRestore(ctx context.Context, pod *corev1.Pod) 
 	if err != nil {
 		return nil, err
 	}
-	artifact, err := w.resolveRestoreArtifact(fmt.Sprintf("%s/%s", pod.Namespace, pod.Name), target)
+	artifact, err := w.resolveRestoreArtifact(fmt.Sprintf("%s/%s", pod.Namespace, pod.Name), target, content)
 	if err != nil {
 		return nil, err
 	}
@@ -530,7 +631,20 @@ func (w *NodeController) preflightRestore(ctx context.Context, pod *corev1.Pod) 
 	if w.config.CRIU.TcpEstablished && pod.Status.PodIP == "" {
 		return nil, newRestorePendingError("PodIPPending", fmt.Sprintf("Waiting for restore Pod %s/%s to receive an IP address", pod.Namespace, pod.Name))
 	}
-	return &restorePlan{artifact: artifact, mappings: mappings, skipCompatCheck: skipCompatCheck}, nil
+	// The post-restore action is checked against the Pod spec here, so an
+	// action that can never run restores nothing.
+	postRestore, postRestorePeriod, err := planPostRestore(pod, mappings,
+		postRestoreAction(content, target.SourceContainerName), w.hookExec, w.hookHTTP)
+	if err != nil {
+		return nil, err
+	}
+	return &restorePlan{
+		artifact:          artifact,
+		mappings:          mappings,
+		skipCompatCheck:   skipCompatCheck,
+		postRestore:       postRestore,
+		postRestorePeriod: postRestorePeriod,
+	}, nil
 }
 
 func (w *NodeController) getPodSnapshotFromPod(ctx context.Context, pod *corev1.Pod) (*snapshotv1alpha1.PodSnapshot, error) {
@@ -611,10 +725,38 @@ func validatePodSnapshotContentForRestore(content *snapshotv1alpha1.PodSnapshotC
 	return nil
 }
 
+// RestoreDestinations returns the names of the containers a restore Pod
+// restores into. When the Pod carries no container map, the destination is the
+// captured container, which the PodSnapshot's spec names. That spec is set at
+// creation and immutable, so this works while the snapshot is still being
+// taken. It checks nothing else: the restore itself still runs the full
+// preflight, including the bound PodSnapshotContent.
+func (w *NodeController) RestoreDestinations(ctx context.Context, pod *corev1.Pod) ([]string, error) {
+	source := ""
+	if _, mapped := pod.Annotations[podcontract.RestoreContainerMapAnnotation]; !mapped {
+		snapshot, err := w.getPodSnapshotFromPod(ctx, pod)
+		if err != nil {
+			return nil, err
+		}
+		if source, err = singleTargetContainer(snapshot.Spec.Source.PodRef.Containers); err != nil {
+			return nil, err
+		}
+	}
+	mappings, err := podcontract.ContainerMappingsFromAnnotations(pod.Annotations, source)
+	if err != nil {
+		return nil, err
+	}
+	destinations := make([]string, 0, len(mappings))
+	for _, mapping := range mappings {
+		destinations = append(destinations, mapping.Destination)
+	}
+	return destinations, nil
+}
+
 // validateRestoreTarget resolves the captured source and validates every
 // requested destination against the restore Pod.
 func validateRestoreTarget(pod *corev1.Pod, snapshot *snapshotv1alpha1.PodSnapshot, content *snapshotv1alpha1.PodSnapshotContent) (*restoreTarget, []podcontract.ContainerMapping, error) {
-	containerName, err := singleTargetContainer(content)
+	containerName, err := singleTargetContainer(content.Spec.Source.PodRef.Containers)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -634,7 +776,16 @@ func validateRestoreTarget(pod *corev1.Pod, snapshot *snapshotv1alpha1.PodSnapsh
 
 // resolveRestoreArtifact resolves the validated restore target to its physical
 // checkpoint directory. A nil error always returns a complete artifact.
-func (w *NodeController) resolveRestoreArtifact(podKey string, target *restoreTarget) (*restoreArtifact, error) {
+// resolveRestoreArtifact: legacy content is ready when the filesystem artifact
+// exists; bound content is ready once status records a published container.
+func (w *NodeController) resolveRestoreArtifact(
+	podKey string,
+	target *restoreTarget,
+	content *snapshotv1alpha1.PodSnapshotContent,
+) (*restoreArtifact, error) {
+	if content.Spec.Storage != nil {
+		return w.resolveBoundRestoreArtifact(target, content)
+	}
 	path, err := nsmount.ResolveArtifactPath(w.config.Storage.BasePath, target.ContentUID, target.SourceContainerName)
 	if err != nil {
 		return nil, err
@@ -649,7 +800,8 @@ func (w *NodeController) resolveRestoreArtifact(podKey string, target *restoreTa
 		return nil, err
 	}
 	if !ready {
-		return nil, newRestorePendingError("ArtifactPending", fmt.Sprintf("Waiting for artifact %s", path))
+		// Ready guarantees a usable artifact; absence is stale state, not a retryable dependency.
+		return nil, fmt.Errorf("artifact %s for Ready PodSnapshotContent %s is missing", path, content.Name)
 	}
 	return &restoreArtifact{
 		SnapshotName:        target.SnapshotName,
@@ -657,6 +809,30 @@ func (w *NodeController) resolveRestoreArtifact(podKey string, target *restoreTa
 		SourceContainerName: target.SourceContainerName,
 		Path:                path,
 	}, nil
+}
+
+func (w *NodeController) resolveBoundRestoreArtifact(
+	target *restoreTarget,
+	content *snapshotv1alpha1.PodSnapshotContent,
+) (*restoreArtifact, error) {
+	if content.Status.Storage != nil {
+		for _, published := range content.Status.Storage.Artifacts {
+			if published.ContainerName != target.SourceContainerName {
+				continue
+			}
+			return &restoreArtifact{
+				SnapshotName:        target.SnapshotName,
+				ContentUID:          target.ContentUID,
+				SourceContainerName: target.SourceContainerName,
+				PublishedArtifact: &pagebroker.PublishedArtifact{
+					StoreId:        content.Spec.Storage.StoreID,
+					ArtifactHandle: published.ArtifactHandle,
+				},
+			}, nil
+		}
+	}
+	return nil, newRestorePendingError("ArtifactPending",
+		fmt.Sprintf("Waiting for a published artifact for container %s", target.SourceContainerName))
 }
 
 // restorePodContainers owns one restore pass for the Pod. Workers never write
@@ -678,6 +854,11 @@ func (w *NodeController) restorePodContainers(ctx context.Context, pod *corev1.P
 	for i, mapping := range plan.mappings {
 		i, destination := i, mapping.Destination
 		workers.Go(func() {
+			// sync.WaitGroup.Go recovers only to re-panic, so a panic here
+			// would kill the agent. Report it as a failed destination instead.
+			results[i] = restoreResult{destination: destination, state: restoreResultFailed,
+				reason: "agent panicked restoring this container"}
+			defer recoverPanic(w.log, "restore destination", nil, "pod", podKey, "destination", destination)
 			results[i] = w.restoreDestination(ctx, pod, plan, destination, podKey, recovering)
 		})
 	}
@@ -744,6 +925,14 @@ func tallyRestoreResults(results []restoreResult) restoreTally {
 		}
 	}
 	return tally
+}
+
+// logWithStep adds the failing step as a structured key when the error names one.
+func logWithStep(log logr.Logger, err error) logr.Logger {
+	if step := executor.StepOf(err); step != "" {
+		return log.WithValues("step", string(step))
+	}
+	return log
 }
 
 // verdict concludes one pass, still in progress or terminal, from the counts
@@ -838,6 +1027,10 @@ func (w *NodeController) restoreDestination(
 	emitPodEvent(ctx, w.clientset, log, pod, snapshotEventComponent, corev1.EventTypeNormal, restoreRequestedReason, fmt.Sprintf("Restore requested from PodSnapshot %s for destination %s", artifact.SnapshotName, destination))
 
 	if err := w.runRestore(ctx, pod, plan, destination, containerID, startedAt, recovering); err != nil {
+		if errors.Is(err, errRestoreInterrupted) {
+			// Not an outcome: the next agent resumes the post-restore action.
+			return result
+		}
 		var incompatible *compat.IncompatibleError
 		if errors.As(err, &incompatible) {
 			result.state = restoreResultIncompatible
@@ -847,7 +1040,7 @@ func (w *NodeController) restoreDestination(
 		}
 		result.state = restoreResultFailed
 		result.reason = err.Error()
-		log.Error(err, "Restore controller worker failed")
+		logWithStep(log, err).Error(err, "Restore controller worker failed")
 		emitPodEvent(ctx, w.clientset, log, pod, snapshotEventComponent, corev1.EventTypeWarning, "RestoreWorkerFailed", err.Error())
 		return result
 	}
@@ -856,7 +1049,8 @@ func (w *NodeController) restoreDestination(
 }
 
 // resolveRestoreContainerID uses the kubelet-published status fast path, then
-// polls the node runtime inline while this Pod's queue key remains in progress.
+// polls inline while this Pod's queue key remains in progress: first for the
+// container the NRI plugin saw start, then the node runtime.
 func (w *NodeController) resolveRestoreContainerID(ctx context.Context, pod *corev1.Pod, destination, podKey string) (string, bool) {
 	if containerID := restoreContainerIDFromStatus(pod, destination); containerID != "" {
 		return containerID, false
@@ -872,6 +1066,17 @@ func (w *NodeController) resolveRestoreContainerID(ctx context.Context, pod *cor
 	tick := time.NewTicker(restoreContainerResolveInterval)
 	defer tick.Stop()
 	for {
+		// Taken, not read: a restore consumes it, and a container started
+		// later is reported again.
+		if started, ok := w.startedRestoreContainers.LoadAndDelete(restoreContainerKey(pod.UID, destination)); ok {
+			w.log.V(1).Info("Resolved restore container started under NRI",
+				"pod", podKey,
+				"container", destination,
+				"container_id", started,
+			)
+			return started.(string), false
+		}
+
 		resolveCtx, cancel := restoreContainerResolveAttemptContext(ctx, deadlineAt)
 		containerID, err := w.runtime.ResolveContainerIDByPod(resolveCtx, pod.Name, pod.Namespace, destination)
 		cancel()
@@ -907,18 +1112,27 @@ func (w *NodeController) resolveRestoreContainerID(ctx context.Context, pod *cor
 //     CRIU-restored process resumes inside the polling loop that waits on
 //     this file, exits quiescence, and resumes the engine. On failure, write
 //     restore-failed and kill the placeholder instead.
-func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, plan *restorePlan, destination, containerID string, startedAt time.Time, recovering bool) error {
+//  3. With a lifecycle.postRestore action, notify the application within the
+//     same deadline. The restore preflight already checked its settings;
+//     nothing checks its file before step 2, so the release is not delayed.
+//     A failure here also fails the restore and kills the container.
+func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, plan *restorePlan, destination, containerID string, startedAt time.Time, recovering bool) (retErr error) {
 	op := w.newRestoreOperation(pod, plan, destination, containerID, startedAt)
+	// Without this the placeholder keeps waiting for a restore that panicked.
+	defer recoverPanic(op.log, "restore", func(err error) {
+		retErr = op.failRestore(ctx, err)
+	}, "destination", destination)
 	if recovering {
 		completed, err := op.recoverCompletedRestore(ctx)
 		if err != nil {
 			return err
 		}
 		if completed {
-			return nil
+			return op.recoverPostRestore(ctx)
 		}
 	}
 
+	// One deadline covers the restore and its post-restore action.
 	restoreCtx := ctx
 	if timeout := w.config.Restore.RestoreTimeout(); timeout > 0 {
 		var cancel context.CancelFunc
@@ -939,10 +1153,35 @@ func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, plan *
 		if !errors.As(err, &cleanupErr) {
 			return op.failRestore(ctx, err)
 		}
-		op.log.Error(cleanupErr, "Restore completed with cleanup errors")
+		logWithStep(op.log, err).Error(cleanupErr, "Restore completed with cleanup errors")
 		emitPodEvent(ctx, w.clientset, op.log, pod, snapshotEventComponent, corev1.EventTypeWarning, "RestoreCleanupFailed", cleanupErr.Error())
 	}
-	return op.completeRestore(ctx, restored)
+	if err := op.completeRestore(ctx, restored); err != nil {
+		return err
+	}
+	if err := op.notifyPostRestore(restoreCtx); err != nil {
+		return op.failPostRestore(ctx, err)
+	}
+	return nil
+}
+
+// recoverPostRestore finishes a restore that an agent restart interrupted
+// after restore-complete: only the post-restore action can be left, and CRIU
+// must never run again. This pass's preflight already checked its settings.
+//
+// The interrupted run's deadline is gone with it, so the action gets a full
+// config.restore.timeoutSeconds again: a restart can extend it by one timeout.
+func (op *restoreOperation) recoverPostRestore(ctx context.Context) error {
+	postCtx := ctx
+	if timeout := op.controller.config.Restore.RestoreTimeout(); timeout > 0 {
+		var cancel context.CancelFunc
+		postCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	if err := op.notifyPostRestore(postCtx); err != nil {
+		return op.failPostRestore(ctx, err)
+	}
+	return nil
 }
 
 // recoverCompletedRestore avoids replaying CRIU when the destination-scoped
@@ -977,14 +1216,16 @@ func (w *NodeController) newRestoreOperation(
 	podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 	artifact := plan.artifact
 	return &restoreOperation{
-		controller:      w,
-		pod:             pod,
-		artifact:        artifact,
-		skipCompatCheck: plan.skipCompatCheck,
-		destination:     destination,
-		containerID:     containerID,
-		startedAt:       startedAt,
-		log:             w.log.WithValues("pod", podKey, "snapshot", artifact.SnapshotName, "content_uid", artifact.ContentUID, "source_container", artifact.SourceContainerName, "destination_container", destination, "container_id", containerID),
+		controller:        w,
+		pod:               pod,
+		artifact:          artifact,
+		postRestore:       plan.postRestore,
+		postRestorePeriod: plan.postRestorePeriod,
+		skipCompatCheck:   plan.skipCompatCheck,
+		destination:       destination,
+		containerID:       containerID,
+		startedAt:         startedAt,
+		log:               w.log.WithValues("pod", podKey, "snapshot", artifact.SnapshotName, "content_uid", artifact.ContentUID, "source_container", artifact.SourceContainerName, "destination_container", destination, "container_id", containerID),
 	}
 }
 
@@ -1001,24 +1242,41 @@ func (op *restoreOperation) executeRestore(ctx context.Context) (executor.Restor
 		ArtifactContainerName:       op.artifact.SourceContainerName,
 		DestinationContainerName:    op.destination,
 		SkipCompatCheck:             op.skipCompatCheck,
+		WithoutProxy:                w.withoutProxy,
 		Clientset:                   w.clientset,
 		CustomStorageAvailable:      w.config.CustomStorageAvailable,
 		PageBrokerControlSocketPath: w.config.PageBroker.ControlSocketPath,
 		PageBrokerRestoreMode:       w.config.PageBroker.RestoreMode,
+		PublishedArtifact:           op.artifact.PublishedArtifact,
 	}
 	return w.restoreFn(ctx, w.runtime, op.log, req, w.injector)
 }
 
 func (op *restoreOperation) failRestore(ctx context.Context, restoreErr error) error {
 	w := op.controller
-	op.log.Error(restoreErr, "External restore failed")
+	logWithStep(op.log, restoreErr).Error(restoreErr, "External restore failed")
 	// Re-resolve because restore may fail before discovering the placeholder PID.
 	placeholderHostPID, _, err := w.runtime.ResolveContainer(ctx, op.containerID)
 	if err != nil {
+		// Nothing can be killed, so the marker is the only way the container's
+		// proxy learns that no restore is coming. With no process in the
+		// container to write through, it goes through the node's path of the
+		// control volume. kubelet names that path after the Pod's UID on the
+		// node, which in a vCluster differs from this Pod's; the runtime knows
+		// it while the container exists.
+		podUID := string(op.pod.UID)
+		if nodeUID, uidErr := w.runtime.ResolveContainerPodUID(ctx, op.containerID); uidErr == nil {
+			podUID = nodeUID
+		} else {
+			op.log.V(1).Info("Cannot read the Pod's UID on the node; using its own", "error", uidErr.Error())
+		}
+		if markErr := w.writePodControlSentinelFn(podUID, op.destination, podcontract.RestoreFailedFile, restoreFailedSentinelContents); markErr != nil {
+			op.log.Error(markErr, "Failed to write restore-failed sentinel through the host path")
+		}
 		return errors.Join(restoreErr, fmt.Errorf("placeholder PID could not be resolved after restore failure: %w", err))
 	}
 	op.markRestoreFailed(placeholderHostPID)
-	if err := w.sendSignalFn(op.log, placeholderHostPID, syscall.SIGKILL, "restore failed"); err != nil {
+	if err := op.killPlaceholder(placeholderHostPID, "restore failed"); err != nil {
 		return errors.Join(restoreErr, fmt.Errorf("placeholder could not be killed after restore failure: %w", err))
 	}
 	return restoreErr
@@ -1033,7 +1291,7 @@ func (op *restoreOperation) completeRestore(ctx context.Context, restored execut
 	if err := w.writeControlSentinelFn(placeholderHostPID, podcontract.RestoreCompleteFile, contents); err != nil {
 		op.log.Error(err, "Failed to write restore-complete sentinel")
 		op.markRestoreFailed(placeholderHostPID)
-		if killErr := w.sendSignalFn(op.log, placeholderHostPID, syscall.SIGKILL, "restore sentinel failed"); killErr != nil {
+		if killErr := op.killPlaceholder(placeholderHostPID, "restore sentinel failed"); killErr != nil {
 			return errors.Join(fmt.Errorf("failed to write restore-complete sentinel: %w", err), fmt.Errorf("placeholder could not be killed: %w", killErr))
 		}
 		return fmt.Errorf("failed to write restore-complete sentinel: %w", err)
@@ -1049,6 +1307,19 @@ func (op *restoreOperation) markRestoreFailed(placeholderHostPID int) {
 	if err := op.controller.writeControlSentinelFn(placeholderHostPID, podcontract.RestoreFailedFile, restoreFailedSentinelContents); err != nil {
 		op.log.Error(err, "Failed to write restore-failed sentinel")
 	}
+}
+
+// killPlaceholder kills the destination container's init process after
+// markRestoreFailed. The restore proxy exits by itself once it sees
+// restore-failed, so it may already be gone: that is the goal of the kill,
+// not an error.
+func (op *restoreOperation) killPlaceholder(placeholderHostPID int, reason string) error {
+	err := op.controller.sendSignalFn(op.log, placeholderHostPID, syscall.SIGKILL, reason)
+	if errors.Is(err, syscall.ESRCH) {
+		op.log.V(1).Info("Placeholder already exited", "pid", placeholderHostPID)
+		return nil
+	}
+	return err
 }
 
 // applyRestoredCondition uses server-side apply against the status subresource.
@@ -1242,6 +1513,11 @@ func (w *NodeController) runCaptureQueue(ctx context.Context) {
 // meanwhile collapse into one redelivery after Done.
 func (w *NodeController) processCaptureQueueItem(ctx context.Context, name string) {
 	defer w.captureQueue.Done(name)
+	// A panic here would otherwise kill every other capture and restore on
+	// this node.
+	defer recoverPanic(w.log, "capture work order", func(err error) {
+		w.failCaptureAfterPanic(ctx, name, err)
+	}, "content", name)
 
 	if err := w.reconcileCapture(ctx, name); err != nil {
 		w.log.Error(err, "Failed to reconcile capture work order", "content", name)

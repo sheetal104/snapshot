@@ -19,8 +19,12 @@ state loop with two contractual properties this file pins down:
 from __future__ import annotations
 
 import os
+import signal
+import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -84,6 +88,178 @@ def test_snapshotjob_cpu_source_observes_before_ready_and_ignores_sentinel(
 
 
 @pytest.mark.workload
+def test_cpu_source_logs_and_exits_on_request(tmp_path: Path) -> None:
+    # The restored-workload e2e test reads these lines from the restore Pod's
+    # log, and ends the workload through the exit request.
+    control_dir = tmp_path / "snapshot-control"
+    state_dir = tmp_path / "e2e-state"
+    control_dir.mkdir()
+    proc = subprocess.Popen(
+        ["bash", "-c", render_cpu_source(control_dir, state_dir)],
+        env={**os.environ, workloads.SOURCE_TOKEN_ENV: "unit-source-token"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not (control_dir / "ready-for-snapshot").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        (state_dir / "exit-request").write_text("7\n")
+        output, _ = proc.communicate(timeout=15)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    assert proc.returncode == 7
+    assert "[source] observation seq=0" in output
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def hooks_status(port: int, path: str = workloads.HOOKS_STATUS_PATH, method: str = "GET") -> int:
+    request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
+@pytest.mark.workload
+def test_hooks_server_answers_the_lifecycle_hooks(tmp_path: Path) -> None:
+    # The HTTP lifecycle hook e2e tests drive this server: the probe gets 503
+    # until the test creates CHECKPOINT_READY, then 200; the post-restore POST
+    # leaves RELEASE_MARKER, as a file action would.
+    control_dir = tmp_path / "snapshot-control"
+    state_dir = tmp_path / "e2e-state"
+    release_dir = tmp_path / "app-release"
+    control_dir.mkdir()
+    release_dir.mkdir()
+    script = (
+        workloads.source_command("test-image", gpu=False, hooks_server=True)
+        .replace(workloads.CONTROL_DIR, str(control_dir))
+        .replace(workloads.STATE_DIR, str(state_dir))
+        .replace(workloads.RELEASE_DIR, str(release_dir))
+        .replace("/tmp/hooks-server", str(tmp_path / "hooks-server"))
+    )
+    port = free_port()
+    proc = subprocess.Popen(
+        ["bash", "-c", script],
+        env={
+            **os.environ,
+            workloads.SOURCE_TOKEN_ENV: "unit-source-token",
+            "SNAPSHOT_E2E_HOOKS_PORT": str(port),
+        },
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,  # so the server, a child of bash, is stopped too
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                status = hooks_status(port)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.05)
+        assert status == 503
+        (state_dir / "checkpoint-ready").touch()
+        assert hooks_status(port) == 200
+        assert hooks_status(port, path="/other") == 404
+        assert hooks_status(port, method="POST") == 404
+        assert not (release_dir / "released").exists()
+        assert hooks_status(port, path=workloads.HOOKS_RESUME_PATH, method="POST") == 204
+        assert (release_dir / "released").exists()
+        assert hooks_status(port, path=workloads.HOOKS_RESUME_PATH) == 404
+    finally:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=10)
+
+
+@pytest.mark.workload
+def test_release_dir_helpers_give_each_container_its_own_marker() -> None:
+    pod = {
+        "spec": {
+            "containers": [{"name": "engine-0", "image": "img"}, {"name": "engine-1", "image": "img"}],
+            "volumes": [],
+        }
+    }
+    workloads.add_release_dir(pod)
+    mounts = [c["volumeMounts"][0] for c in pod["spec"]["containers"]]
+    assert [m["subPath"] for m in mounts] == ["engine-0", "engine-1"]
+    assert {m["mountPath"] for m in mounts} == {workloads.RELEASE_DIR}
+
+
+@pytest.mark.workload
+def test_only_an_opted_in_cpu_source_runs_the_hooks_server() -> None:
+    assert "perl" not in workloads.source_command("test-image", gpu=False)
+    assert "perl" not in workloads.snapshotjob_source_command("test-image", gpu=False)
+    with pytest.raises(ValueError):
+        workloads.source_command("test-image", gpu=True, hooks_server=True)
+
+
+@pytest.mark.workload
+def test_the_workload_image_has_perl_for_the_hooks_server() -> None:
+    # The workload image is the agent image. verify-base-packages keeps this
+    # list equal to its base image, so a base image without Perl fails here,
+    # in the same PR, instead of in a cluster run.
+    root = Path(__file__).resolve().parents[2]
+    for name in ("base-packages.tsv", "base-packages.arm64.tsv"):
+        packages = (root / "agent" / "compliance" / name).read_text().splitlines()
+        assert any(line.startswith("perl-base\t") for line in packages), name
+
+
+@pytest.mark.workload
+def test_cpu_source_exits_with_its_code_on_sigterm_when_asked(tmp_path: Path) -> None:
+    # The pod deletion e2e test checks this code: the restored workload
+    # handled the SIGTERM the restore proxy forwarded.
+    control_dir = tmp_path / "snapshot-control"
+    state_dir = tmp_path / "e2e-state"
+    control_dir.mkdir()
+    script = workloads.source_command("test-image", gpu=False, handle_sigterm=True)
+    script = script.replace(workloads.CONTROL_DIR, str(control_dir)).replace(
+        workloads.STATE_DIR, str(state_dir)
+    )
+    proc = subprocess.Popen(
+        ["bash", "-c", script],
+        env={**os.environ, workloads.SOURCE_TOKEN_ENV: "unit-source-token"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not (control_dir / "ready-for-snapshot").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert (control_dir / "ready-for-snapshot").exists(), "source never became ready"
+        proc.send_signal(signal.SIGTERM)
+        # bash runs the trap once the loop's sleep returns.
+        proc.communicate(timeout=15)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    assert proc.returncode == workloads.SIGTERM_EXIT
+
+
+@pytest.mark.workload
+def test_only_an_opted_in_cpu_source_handles_sigterm() -> None:
+    assert "trap" not in workloads.source_command("test-image", gpu=False)
+    assert "trap" not in workloads.snapshotjob_source_command("test-image", gpu=False)
+    with pytest.raises(ValueError):
+        workloads.source_command("test-image", gpu=True, handle_sigterm=True)
+
+
+@pytest.mark.workload
 @pytest.mark.parametrize("gpu", [False, True])
 def test_no_workload_waits_on_snapshot_complete(gpu: bool) -> None:
     for script in (
@@ -92,6 +268,50 @@ def test_no_workload_waits_on_snapshot_complete(gpu: bool) -> None:
     ):
         assert workloads.SNAPSHOT_COMPLETE not in script
         assert workloads.SOURCE_READY in script
+
+
+@pytest.mark.workload
+def test_snapshotjob_helper_waits_before_signalling_capture_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SNAPSHOT_E2E_WORKLOAD_IMAGE", "snapshot-workload:test")
+    config = k8s.E2EConfig(
+        namespace="snapshot-e2e",
+        release="snapshot",
+        pvc_name="snapshot-pvc",
+        kubeconfig=None,
+    )
+    template = workloads.snapshotjob_helper_pod_template(
+        config=config,
+        run=workloads.TestRun.new("helper-ready"),
+        helper_command="true",
+        wait_for_helper_before_capture=True,
+    )
+
+    command = template["spec"]["containers"][0]["command"][2]
+    target = template["spec"]["containers"][0]
+    helper_wait = f"while [ ! -f {workloads.HELPER_SYNC_DIR}/helper-finished ]; do sleep 0.1; done"
+    capture_ready = f"echo ready > {workloads.SOURCE_READY}"
+    assert command.index(helper_wait) < command.index(capture_ready)
+    assert target["readinessProbe"]["exec"]["command"] == [
+        "cat",
+        f"{workloads.HELPER_SYNC_DIR}/helper-finished",
+    ]
+
+    release_gated_template = workloads.snapshotjob_helper_pod_template(
+        config=config,
+        run=workloads.TestRun.new("helper-release-gated"),
+        helper_command="true",
+        wait_for_helper_before_capture=False,
+        wait_for_capture_release=True,
+    )
+    release_gated_target = release_gated_template["spec"]["containers"][0]
+    release_command = release_gated_target["command"][2]
+    capture_release = (
+        f"while [ ! -f {workloads.HELPER_SYNC_DIR}/capture-release ]; do sleep 0.1; done"
+    )
+    assert release_command.index(capture_release) < release_command.index(capture_ready)
+    assert "readinessProbe" not in release_gated_target
 
 
 @pytest.mark.workload
@@ -138,10 +358,9 @@ def test_restore_manifests_use_canonical_control_mount_and_startup_gate(
         "cat",
         workloads.RESTORE_DONE,
     ]
-    # The standby flag is what keeps the placeholder from loading a model
-    # itself; it must be injected under its single canonical name.
-    standby_env = {"name": "SNAPSHOT_RESTORE_STANDBY", "value": "1"}
-    assert standby_env in single_container["env"]
+    # The restore proxy replaces the command, so nothing needs the old
+    # standby flag, under either name.
+    assert all("RESTORE_STANDBY" not in e["name"] for e in single_container["env"])
     assert all(not e["name"].startswith("DYN_") for e in single_container["env"])
 
     multi, _ = workloads.multi_restore_pod(
@@ -155,5 +374,5 @@ def test_restore_manifests_use_canonical_control_mount_and_startup_gate(
             "cat",
             workloads.RESTORE_DONE,
         ]
-        assert standby_env in container["env"]
+        assert all("RESTORE_STANDBY" not in e["name"] for e in container["env"])
         assert all(not e["name"].startswith("DYN_") for e in container["env"])

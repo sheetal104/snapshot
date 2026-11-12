@@ -9,6 +9,8 @@ See docs/development/benchmarks-guide.md for the full walkthrough.
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import uuid
 import json
 import sys
 from pathlib import Path
@@ -21,10 +23,14 @@ from snapshot_e2e import k8s
 from snapshot_benchmarks import metadata, report, results
 from snapshot_benchmarks.engines import ModelSpec
 from snapshot_benchmarks.engines.vllm import VLLMEngine
+from snapshot_benchmarks.engines.sglang import SGLangEngine
+from snapshot_benchmarks.engines.trtllm import TRTLLMEngine
+from snapshot_benchmarks.workload import app_configmap, instrument_pod
+from snapshot_benchmarks.measurement import save
 from snapshot_benchmarks import run
 from snapshot_benchmarks.run import BenchmarkConfig, CleanupError, run_benchmark
 
-ENGINES = {"vllm": VLLMEngine()}
+ENGINES = {"vllm": VLLMEngine(), "sglang": SGLangEngine(), "trtllm": TRTLLMEngine()}
 
 
 def _parse_toleration(value: str) -> dict[str, str]:
@@ -42,7 +48,15 @@ def _parse_toleration(value: str) -> dict[str, str]:
     return {"key": key, "operator": "Equal", "value": val, "effect": effect}
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
 def _add_cluster_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--context", required=True, help="Explicit Kubernetes context")
     parser.add_argument(
         "--namespace",
         default=None,
@@ -57,8 +71,16 @@ def _add_cluster_args(parser: argparse.ArgumentParser) -> None:
         "explicitly if your install keeps them separate (e.g. 'snapshot' vs. "
         "'default', as this repo's own manual setup does).",
     )
-    parser.add_argument("--release", default=None, help="Helm release name. Defaults to E2EConfig.from_env().")
-    parser.add_argument("--pvc-name", default=None, help="Checkpoint PVC name. Defaults to E2EConfig.from_env().")
+    parser.add_argument(
+        "--release",
+        default=None,
+        help="Helm release name. Defaults to E2EConfig.from_env().",
+    )
+    parser.add_argument(
+        "--pvc-name",
+        default=None,
+        help="Checkpoint PVC name. Defaults to E2EConfig.from_env().",
+    )
 
 
 def _benchmark_config(args: argparse.Namespace) -> BenchmarkConfig:
@@ -70,6 +92,13 @@ def _benchmark_config(args: argparse.Namespace) -> BenchmarkConfig:
         release=args.release or base.release,
         pvc_name=args.pvc_name or base.pvc_name,
         kubeconfig=base.kubeconfig,
+        context=args.context,
+        node=getattr(args, "node", None),
+        model_pvc=getattr(args, "model_pvc", None),
+        work_pvc=getattr(args, "work_pvc", None),
+        drop_page_cache=not getattr(args, "no_drop_page_cache", False),
+        detailed_timing=getattr(args, "detailed_timing", False),
+        restore_count=getattr(args, "restore_count", 3),
     )
 
 
@@ -105,8 +134,10 @@ def _load_models(path: Path) -> list[ModelSpec]:
         ModelSpec(
             label=entry["label"],
             hf_id_or_path=entry["hf_id_or_path"],
-            reported_weights_bytes=entry.get("reported_weights_bytes"),
             env=_stringify_env(entry["label"], entry.get("env")),
+            tp=entry.get("tp", 1),
+            ep=entry.get("ep", 1),
+            engine_args=entry.get("engine_args", {}),
         )
         for entry in data["models"]
     ]
@@ -114,8 +145,10 @@ def _load_models(path: Path) -> list[ModelSpec]:
 
 def cmd_metadata(args: argparse.Namespace) -> int:
     cfg = _benchmark_config(args)
-    k8s.configure(cfg.workload_e2e_config())
-    env = metadata.collect_environment(pvc_namespace=cfg.snapshot_namespace, pvc_name=cfg.pvc_name)
+    cfg.configure()
+    env = metadata.collect_environment(
+        pvc_namespace=cfg.snapshot_namespace, pvc_name=cfg.pvc_name
+    )
     print(json.dumps(_to_json(env), indent=2))
     return 0
 
@@ -128,29 +161,91 @@ def _to_json(dataclass_instance) -> dict:
 
 def _setup(args: argparse.Namespace) -> tuple[BenchmarkConfig, Any]:
     cfg = _benchmark_config(args)
-    k8s.configure(cfg.workload_e2e_config())
     return cfg, ENGINES[args.engine]
 
 
+def _reject_keep_with_repeats(args: argparse.Namespace) -> int | None:
+    """A kept pod still holds its GPU, so the next repeat cannot schedule."""
+    if getattr(args, "keep", False) and getattr(args, "repeats", 1) > 1:
+        print(
+            "error: --keep cannot be combined with --repeats greater than 1",
+            file=sys.stderr,
+        )
+        return 2
+    return None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
+    if rejected := _reject_keep_with_repeats(args):
+        return rejected
     cfg, engine = _setup(args)
-    models = {m.label: m for m in _load_models(Path(args.models))}
-    if args.model_label not in models:
-        print(f"error: {args.model_label!r} not found in {args.models}", file=sys.stderr)
+    models = (
+        {m.label: m for m in _load_models(Path(args.models))} if not args.model else {}
+    )
+    if args.model:
+        model = ModelSpec(
+            label=args.model_label or Path(args.model).name,
+            hf_id_or_path=args.model,
+        )
+    elif args.model_label not in models:
+        print(
+            f"error: {args.model_label!r} not found in {args.models}", file=sys.stderr
+        )
         print(f"available: {sorted(models)}", file=sys.stderr)
         return 2
-    model = models[args.model_label]
-
-    result = _run_one(cfg, engine, model, args)
-    out_dir = results.invocation_dir(Path(args.output_dir), git_sha=result.git_sha)
-    path = results.write_result(result, out_dir)
-    print(f"wrote {path}")
+    else:
+        model = models[args.model_label]
+    out_dir = results.invocation_dir(Path(args.output_dir), git_sha=run._git_sha())
+    for repeat in range(1, args.repeats + 1):
+        if args.repeats > 1:
+            print(f"=== {model.label} (repeat {repeat}/{args.repeats}) ===")
+        result = _run_one(cfg, engine, model, args, out_dir)
+        if result is None:  # dry run: nothing to write, still render every repeat
+            continue
+        path = results.write_result(result, out_dir)
+        print(f"wrote {path}")
     return 0
 
 
 def _run_one(
-    cfg: BenchmarkConfig, engine, model, args: argparse.Namespace
-) -> run.RunResult:
+    cfg: BenchmarkConfig, engine, model, args: argparse.Namespace, out_dir: Path
+) -> run.RunResult | None:
+    extra = json.loads(args.engine_args)
+    if not isinstance(extra, dict):
+        raise ValueError("engine-args must be a JSON object")
+    model = dataclasses.replace(
+        model,
+        tp=args.tp if args.tp is not None else model.tp,
+        ep=args.ep if args.ep is not None else model.ep,
+        engine_args={**model.engine_args, **extra},
+    )
+    if args.dry_run:
+        run_id = uuid.uuid4().hex[:12]
+        folder = out_dir / run_id
+        app = app_configmap(engine, cfg.workload_namespace, "bench-app-" + run_id)
+        save(folder / "app.json", app)
+        for role in ("source", "restore"):
+            build = (
+                engine.build_source_pod
+                if role == "source"
+                else engine.build_restore_pod
+            )
+            kwargs = dict(
+                name="bench-" + role + "-" + run_id,
+                namespace=cfg.workload_namespace,
+                image=args.image,
+                model=model,
+                image_pull_policy=args.image_pull_policy,
+                tolerations=args.toleration,
+            )
+            if role == "restore":
+                kwargs["snapshot_name"] = "bench-snapshot-" + run_id
+            pod = instrument_pod(
+                build(**kwargs), cfg, engine, model, run_id, restore=role == "restore"
+            )
+            save(folder / (role + ".json"), pod)
+        print(f"Rendered guide-based workload into {folder}; no Kubernetes calls")
+        return None
     return run_benchmark(
         cfg,
         engine,
@@ -161,43 +256,60 @@ def _run_one(
         mode=args.mode,
         keep=args.keep,
         timeout=args.timeout,
+        evidence_dir=out_dir,
     )
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
+    if rejected := _reject_keep_with_repeats(args):
+        return rejected
     cfg, engine = _setup(args)
     models = _load_models(Path(args.models))
 
-    out_dir: Path | None = None
+    out_dir = results.invocation_dir(Path(args.output_dir), git_sha=run._git_sha())
     failures: list[str] = []
+    abort = False
     for model in models:
-        print(f"=== {model.label} ===")
-        try:
-            result = _run_one(cfg, engine, model, args)
-        except CleanupError as exc:
-            # Cleanup itself failed -- a pod, PodSnapshot, or
-            # PodSnapshotContent from this model may still be on the cluster.
-            # Unlike an ordinary per-model failure, it is never safe to
-            # continue the sweep from here: the next model could schedule
-            # onto a GPU still held by the leaked resource, or trip over
-            # stale checkpoint state. Always stop, regardless of --fail-fast.
-            print(f"error: {model.label} cleanup failed: {exc}", file=sys.stderr)
-            failures.append(model.label)
-            print("aborting sweep: cluster state may be contaminated, inspect and clean up manually", file=sys.stderr)
+        for repeat in range(1, args.repeats + 1):
+            run_label = (
+                f"{model.label} repeat {repeat}/{args.repeats}"
+                if args.repeats > 1
+                else model.label
+            )
+            print(f"=== {run_label} ===")
+            try:
+                result = _run_one(cfg, engine, model, args, out_dir)
+            except CleanupError as exc:
+                # Cleanup itself failed -- a pod, PodSnapshot, or
+                # PodSnapshotContent from this run may still be on the cluster.
+                # It is never safe to continue from here because the next run
+                # could schedule onto a GPU still held by the leaked resource.
+                print(f"error: {run_label} cleanup failed: {exc}", file=sys.stderr)
+                failures.append(run_label)
+                print(
+                    "aborting sweep: cluster state may be contaminated, inspect and clean up manually",
+                    file=sys.stderr,
+                )
+                abort = True
+                break
+            except Exception as exc:  # noqa: BLE001 - recorded per-run, sweep continues
+                print(f"error: {run_label} failed: {exc}", file=sys.stderr)
+                failures.append(run_label)
+                if args.fail_fast:
+                    raise
+                continue
+            if result is None:
+                continue
+            path = results.write_result(result, out_dir)
+            print(f"wrote {path}")
+        if abort:
             break
-        except Exception as exc:  # noqa: BLE001 - recorded per-model, sweep continues
-            print(f"error: {model.label} failed: {exc}", file=sys.stderr)
-            failures.append(model.label)
-            if args.fail_fast:
-                raise
-            continue
-        if out_dir is None:
-            out_dir = results.invocation_dir(Path(args.output_dir), git_sha=result.git_sha)
-        path = results.write_result(result, out_dir)
-        print(f"wrote {path}")
 
     if failures:
-        print(f"sweep finished with {len(failures)} failure(s): {failures}", file=sys.stderr)
+        print(
+            f"sweep finished with {len(failures)} failure(s): {failures}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 
@@ -225,8 +337,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run one model against one engine.")
     _add_cluster_args(run_parser)
     run_parser.add_argument("--engine", choices=sorted(ENGINES), default="vllm")
-    run_parser.add_argument("--model-label", required=True, help='e.g. "Qwen3 0.6B", must match models.yaml')
-    run_parser.add_argument("--image", required=True, help="Pre-built snapshot-ready engine image (see docs/guides/vllm.md)")
+    run_parser.add_argument(
+        "--model-label", help='e.g. "Qwen3 0.6B", must match models.yaml'
+    )
+    run_parser.add_argument(
+        "--image",
+        required=True,
+        help="Pre-built snapshot-ready engine image (see docs/guides/vllm.md)",
+    )
     run_parser.add_argument(
         "--image-pull-policy",
         default=None,
@@ -234,10 +352,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overrides the guide's own default (Always). Use IfNotPresent for an "
         "image imported directly into the node's container runtime with no registry.",
     )
-    run_parser.add_argument("--models", default=str(Path(__file__).resolve().parents[1] / "models.yaml"))
+    run_parser.add_argument(
+        "--model", help="Cached model ID or local directory under /hf-cache"
+    )
+    run_parser.add_argument(
+        "--models", default=str(Path(__file__).resolve().parents[1] / "models.yaml")
+    )
     run_parser.add_argument("--mode", choices=["cold_start", "both"], default="both")
+    run_parser.add_argument(
+        "--repeats",
+        type=_positive_int,
+        default=1,
+        help="Run the selected model this many times, writing every result to one invocation directory.",
+    )
     run_parser.add_argument("--output-dir", default=str(results.DEFAULT_RESULTS_ROOT))
-    run_parser.add_argument("--keep", action="store_true", help="Skip cleanup, leave pods/snapshot running for debugging.")
+    run_parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="Skip cleanup, leave pods/snapshot running for debugging.",
+    )
     run_parser.add_argument(
         "--toleration",
         action="append",
@@ -257,15 +390,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.set_defaults(func=cmd_run)
 
-    sweep_parser = subparsers.add_parser("sweep", help="Run every model in a models.yaml sequentially.")
+    sweep_parser = subparsers.add_parser(
+        "sweep", help="Run every model in a models.yaml sequentially."
+    )
     _add_cluster_args(sweep_parser)
     sweep_parser.add_argument("--engine", choices=sorted(ENGINES), default="vllm")
     sweep_parser.add_argument("--image", required=True)
     sweep_parser.add_argument(
         "--image-pull-policy", default=None, choices=["Always", "IfNotPresent", "Never"]
     )
-    sweep_parser.add_argument("--models", default=str(Path(__file__).resolve().parents[1] / "models.yaml"))
+    sweep_parser.add_argument(
+        "--models", default=str(Path(__file__).resolve().parents[1] / "models.yaml")
+    )
     sweep_parser.add_argument("--mode", choices=["cold_start", "both"], default="both")
+    sweep_parser.add_argument(
+        "--repeats",
+        type=_positive_int,
+        default=1,
+        help="Run each model this many times, writing every result to one invocation directory.",
+    )
     sweep_parser.add_argument("--output-dir", default=str(results.DEFAULT_RESULTS_ROOT))
     sweep_parser.add_argument("--keep", action="store_true")
     sweep_parser.add_argument("--fail-fast", action="store_true")
@@ -288,11 +431,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sweep_parser.set_defaults(func=cmd_sweep)
 
+    for command in (run_parser, sweep_parser):
+        command.add_argument(
+            "--restore-count", type=int, default=3,
+            help="Number of restores per checkpoint (default: %(default)s)",
+        )
+        command.add_argument(
+            "--detailed-timing",
+            action="store_true",
+            help="Patch engine functions and trace imports for cold-start phase timings",
+        )
+        command.add_argument(
+            "--no-drop-page-cache",
+            action="store_true",
+            help="Skip node page-cache eviction and weight residency verification",
+        )
+        command.add_argument("--node", required=True, help="Node with enough free GPUs")
+        command.add_argument(
+            "--model-pvc", required=True, help="Read-only, pre-populated model volume"
+        )
+        command.add_argument(
+            "--work-pvc", required=True, help="Writable cache and log volume"
+        )
+        command.add_argument("--tp", type=int, help="Tensor-parallel GPU count")
+        command.add_argument(
+            "--ep", type=int, help="Expert parallelism within the TP GPUs"
+        )
+        command.add_argument(
+            "--engine-args", default="{}", help="Engine constructor arguments as JSON"
+        )
+        command.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Write manifests without contacting Kubernetes",
+        )
+
     report_parser = subparsers.add_parser(
-        "report", help="Render a standalone summary from a results directory (does not edit any doc)."
+        "report",
+        help="Render a standalone summary from a results directory (does not edit any doc).",
     )
     report_parser.add_argument("--results-dir", required=True)
-    report_parser.add_argument("--out", default=None, help="Write to this file instead of stdout.")
+    report_parser.add_argument(
+        "--out", default=None, help="Write to this file instead of stdout."
+    )
     report_parser.set_defaults(func=cmd_report)
 
     return parser

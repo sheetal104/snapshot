@@ -37,20 +37,87 @@ func IsDialError(err error) bool {
 	return errors.As(err, &transport) && transport.dial
 }
 
-// failureError carries a Failure reply from PageBroker.
-type failureError struct {
+// FailureError exposes the broker's classification through errors.As. Neither a
+// failure nor a missing transaction after restart authorizes replaying capture.
+type FailureError struct {
 	code    Failure_Code
 	message string
 }
 
-func (e failureError) Error() string {
+func (e *FailureError) Error() string {
 	return fmt.Sprintf("PageBroker %s: %s", e.code, e.message)
+}
+
+// Code returns a known wire failure code; unknown codes map to UNSPECIFIED.
+func (e *FailureError) Code() Failure_Code { return e.code }
+
+// NewFailureError builds a broker failure, so callers outside this package can
+// construct the classifications they handle.
+func NewFailureError(code Failure_Code, message string) *FailureError {
+	return &FailureError{code: failureCode(code), message: message}
+}
+
+// TransactionGone reports whether the broker never had the transaction or it
+// expired.
+func TransactionGone(err error) bool {
+	var failure *FailureError
+	if !errors.As(err, &failure) {
+		return false
+	}
+	switch failure.Code() {
+	case Failure_TRANSACTION_NOT_FOUND, Failure_TRANSACTION_EXPIRED:
+		return true
+	default:
+		return false
+	}
+}
+
+// ignoreAlreadyReleased treats a transaction the broker is not holding as the
+// success Abort asked for, which is what makes Abort idempotent.
+func ignoreAlreadyReleased(err error) error {
+	if TransactionGone(err) {
+		return nil
+	}
+	return err
+}
+
+// CommitWorthRetrying reports whether a failed commit leaves the staged pages
+// worth holding: the failure may clear, or its outcome is unknown. Every other
+// failure is settled, so holding its pages only costs node memory.
+func CommitWorthRetrying(err error) bool {
+	if isRetryableTransportError(err) {
+		return true
+	}
+	var failure *FailureError
+	if !errors.As(err, &failure) {
+		return false
+	}
+	switch failure.Code() {
+	case Failure_STORAGE_ERROR, Failure_UNAVAILABLE, Failure_STORAGE_UNAVAILABLE, Failure_OUTCOME_UNKNOWN:
+		return true
+	default:
+		return false
+	}
+}
+
+func isStorageFailure(code Failure_Code) bool {
+	switch code {
+	case Failure_STORE_MISMATCH, Failure_ACCESS_DENIED, Failure_STORAGE_UNAVAILABLE,
+		Failure_ARTIFACT_NOT_FOUND, Failure_ARTIFACT_CORRUPT, Failure_UNSUPPORTED_ARTIFACT,
+		Failure_OUTCOME_UNKNOWN, Failure_TRANSACTION_EXPIRED:
+		return true
+	default:
+		return false
+	}
 }
 
 func failureCode(code Failure_Code) Failure_Code {
 	switch code {
 	case Failure_UNSPECIFIED, Failure_INVALID_REQUEST, Failure_TRANSACTION_NOT_FOUND, Failure_TRANSACTION_CONFLICT,
-		Failure_INSUFFICIENT_STORAGE, Failure_STORAGE_ERROR, Failure_INTERNAL_ERROR, Failure_UNAVAILABLE:
+		Failure_INSUFFICIENT_STORAGE, Failure_STORAGE_ERROR, Failure_INTERNAL_ERROR, Failure_UNAVAILABLE,
+		Failure_STORE_MISMATCH, Failure_ACCESS_DENIED, Failure_STORAGE_UNAVAILABLE,
+		Failure_ARTIFACT_NOT_FOUND, Failure_ARTIFACT_CORRUPT, Failure_UNSUPPORTED_ARTIFACT,
+		Failure_OUTCOME_UNKNOWN, Failure_TRANSACTION_EXPIRED:
 		return code
 	default:
 		return Failure_UNSPECIFIED

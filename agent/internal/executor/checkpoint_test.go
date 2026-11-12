@@ -15,15 +15,16 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
-
+	criurpc "github.com/checkpoint-restore/go-criu/v8/rpc"
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/funcr"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/ai-dynamo/snapshot/agent/internal/criu"
 	"github.com/ai-dynamo/snapshot/agent/internal/cuda"
 	"github.com/ai-dynamo/snapshot/agent/internal/nsmount"
 	"github.com/ai-dynamo/snapshot/agent/internal/pagebroker"
@@ -51,8 +52,16 @@ func (checkpointPathRuntime) ResolveContainerImageID(context.Context, string) (s
 	return "", errors.New("not implemented")
 }
 
+func (checkpointPathRuntime) ResolveContainerPodUID(context.Context, string) (string, error) {
+	return "", errors.New("not implemented")
+}
+
 func (checkpointPathRuntime) TerminateContainer(context.Context, string) error {
 	return errors.New("not implemented")
+}
+
+func (checkpointPathRuntime) ExecSync(context.Context, string, []string, time.Duration) ([]byte, []byte, error) {
+	return nil, nil, errors.New("not implemented")
 }
 
 func (checkpointPathRuntime) Close() error { return nil }
@@ -74,7 +83,7 @@ func TestCheckpointDoesNotCreateArtifactsBeforeInspection(t *testing.T) {
 	finalDir, err := nsmount.ResolveArtifactPath(cfg.Storage.BasePath, "content-uid", "main")
 	require.NoError(t, err)
 
-	err = Checkpoint(context.Background(), checkpointPathRuntime{}, logr.Discard(), CheckpointRequest{
+	_, err = Checkpoint(context.Background(), checkpointPathRuntime{}, logr.Discard(), CheckpointRequest{
 		ContentUID:    "content-uid",
 		ContainerName: "main",
 	}, cfg)
@@ -286,7 +295,7 @@ func TestCheckpointPreparationFailure(t *testing.T) {
 					}
 					server <- nil
 				}()
-				err = checkpoint(ctx, nil, logr.Discard(), req, cfg,
+				_, err = checkpoint(ctx, nil, logr.Discard(), req, cfg,
 					func(context.Context, snapshotruntime.Runtime, logr.Logger, CheckpointRequest) (*types.CheckpointContainerSnapshot, time.Duration, error) {
 						state := &types.CheckpointContainerSnapshot{PID: -1, RootFS: workingDirectory}
 						if format == "custom-storage" {
@@ -297,25 +306,26 @@ func TestCheckpointPreparationFailure(t *testing.T) {
 						return state, 0, nil
 					})
 				waitPageBrokerTest(t, server)
-				require.ErrorContains(t, err, "prepare PageBroker checkpoint")
+				require.ErrorContains(t, err, "while preparing PageBroker checkpoint")
 				if preparation == "rejected" {
 					assert.ErrorContains(t, err, "STORAGE_ERROR: storage unavailable")
 				} else {
-					assert.ErrorContains(t, err, "prepare PageBroker checkpoint: read PageBroker response: EOF")
+					assert.ErrorContains(t, err, "while preparing PageBroker checkpoint: read PageBroker response: EOF")
 					assert.ErrorIs(t, err, io.EOF)
 				}
-				if cleanup == "confirmed" {
+				switch cleanup {
+				case "confirmed":
 					assert.NotContains(t, err.Error(), "abort PageBroker checkpoint")
-				} else {
-					assert.ErrorContains(t, err, "abort PageBroker checkpoint")
-					if cleanup == "not-found" {
-						assert.ErrorContains(t, err, "TRANSACTION_NOT_FOUND")
-					} else {
-						assert.ErrorContains(t, err, fmt.Sprintf("abort PageBroker checkpoint %q: read PageBroker response: EOF", transactionID))
-						assert.ErrorIs(t, err, io.EOF)
-					}
+				case "not-found":
+					// Already what Abort asked for, so not a cleanup failure.
+					assert.NotContains(t, err.Error(), "abort PageBroker checkpoint")
+					assert.NotContains(t, err.Error(), "TRANSACTION_NOT_FOUND")
+				default:
+					assert.ErrorContains(t, err, fmt.Sprintf("abort PageBroker checkpoint %q: read PageBroker response: EOF", transactionID))
+					assert.ErrorIs(t, err, io.EOF)
 				}
-				assert.False(t, CheckpointNeedsSourceKill(err))
+				_, needsRecovery := SuspendedSourceOf(err)
+				assert.False(t, needsRecovery)
 				for _, path := range []string{workingDirectory, cfg.Storage.BasePath} {
 					entries, err := os.ReadDir(path)
 					require.NoError(t, err)
@@ -416,20 +426,360 @@ func TestCheckpointPageBrokerPrepareFailureDoesNotMutate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	start := time.Now()
-	err := checkpoint(ctx, checkpointPathRuntime{}, logr.Discard(), CheckpointRequest{
+	_, err := checkpoint(ctx, checkpointPathRuntime{}, logr.Discard(), CheckpointRequest{
 		ContentUID:    "content-uid",
 		ContainerName: "main",
 	}, cfg, func(context.Context, snapshotruntime.Runtime, logr.Logger, CheckpointRequest) (*types.CheckpointContainerSnapshot, time.Duration, error) {
 		return &types.CheckpointContainerSnapshot{}, 0, nil
 	})
-	require.ErrorContains(t, err, "prepare PageBroker checkpoint")
+	require.ErrorContains(t, err, "while preparing PageBroker checkpoint")
 	assert.NotContains(t, err.Error(), "abort PageBroker checkpoint")
 	assert.Less(t, time.Since(start), 3*time.Second)
-	assert.False(t, CheckpointNeedsSourceKill(err))
+	_, needsRecovery := SuspendedSourceOf(err)
+	assert.False(t, needsRecovery)
 	assert.NoDirExists(t, filepath.Join(cfg.Storage.BasePath, "artifacts"))
 }
 
-func TestCheckpointNeedsSourceKill(t *testing.T) {
-	assert.True(t, CheckpointNeedsSourceKill(checkpointNeedsSourceKill(errors.New("capture failed"))))
-	assert.False(t, CheckpointNeedsSourceKill(errors.New("prepare failed")))
+func TestCheckpointBoundRejectsMalformedStoreIDBeforeDialing(t *testing.T) {
+	cfg := &types.AgentConfig{
+		Storage:    types.StorageSpec{BasePath: t.TempDir()},
+		PageBroker: types.PageBrokerSpec{ControlSocketPath: filepath.Join(t.TempDir(), "pagebroker.sock")},
+	}
+
+	_, err := Checkpoint(context.Background(), checkpointPathRuntime{}, logr.Discard(), CheckpointRequest{
+		ContentUID:    "content-uid",
+		ContainerName: "main",
+		StoreID:       "not-a-valid-store-id",
+	}, cfg)
+	require.ErrorContains(t, err, "validate storage binding")
+	assert.NotContains(t, err.Error(), "prepare PageBroker checkpoint")
+}
+
+func TestCheckpointBoundSendsArtifactTarget(t *testing.T) {
+	storeID := "store-v1-" + fmt.Sprintf("%064x", 1)
+	target := &pagebroker.ArtifactTarget{
+		StoreId:  storeID,
+		Artifact: &pagebroker.ArtifactIdentity{ArtifactUid: "content-uid", ContainerName: "main"},
+	}
+	listener := listenPageBroker(t)
+	server := make(chan error, 1)
+	go func() {
+		for i := 0; i < 2; i++ {
+			connection, err := listener.Accept()
+			if err != nil {
+				server <- err
+				return
+			}
+			request, err := readPageBrokerTestRequest(connection)
+			if err != nil {
+				connection.Close()
+				server <- err
+				return
+			}
+			response := &pagebroker.Response{}
+			if i == 0 {
+				prepare := request.GetPrepareStagedCheckpoint()
+				if prepare == nil || !proto.Equal(prepare.GetTarget(), target) || prepare.GetDestination() != nil {
+					connection.Close()
+					server <- fmt.Errorf("wrong bound preparation: %v", request)
+					return
+				}
+				response.Result = &pagebroker.Response_Failure{Failure: &pagebroker.Failure{
+					Code: pagebroker.Failure_INVALID_REQUEST.Enum(), Message: proto.String("stop after target validation"),
+				}}
+			} else {
+				if request.GetAbort() == nil {
+					connection.Close()
+					server <- fmt.Errorf("expected Abort: %v", request)
+					return
+				}
+				response.Result = &pagebroker.Response_AbortComplete{AbortComplete: &pagebroker.AbortComplete{}}
+			}
+			err = replyPageBrokerTest(connection, request, response)
+			connection.Close()
+			if err != nil {
+				server <- err
+				return
+			}
+		}
+		server <- nil
+	}()
+	cfg := &types.AgentConfig{PageBroker: types.PageBrokerSpec{ControlSocketPath: listener.Addr().String()}}
+	ctx, cancel := context.WithTimeout(context.Background(), pageBrokerTestTimeout)
+	defer cancel()
+	// Inspection precedes preparation; stop at the broker before CUDA or CRIU executes.
+	_, err := checkpoint(ctx, nil, logr.Discard(), CheckpointRequest{
+		ContentUID: "content-uid", ContainerName: "main", StoreID: storeID,
+	}, cfg, func(context.Context, snapshotruntime.Runtime, logr.Logger, CheckpointRequest) (*types.CheckpointContainerSnapshot, time.Duration, error) {
+		return &types.CheckpointContainerSnapshot{}, 0, nil
+	})
+	require.ErrorContains(t, err, "stop after target validation")
+	waitPageBrokerTest(t, server)
+}
+
+// Recovery hands back exactly the GPU processes the capture found, so the
+// failure has to carry them: a probe cannot tell "not a CUDA process" from a
+// helper that failed, and an empty list would strand a suspended workload.
+func TestSuspendedSourceOf(t *testing.T) {
+	suspended, needsRecovery := SuspendedSourceOf(sourceNeedsRecovery(errors.New("capture failed"), []int{41, 42}, false, false))
+	assert.True(t, needsRecovery)
+	assert.Equal(t, []int{41, 42}, suspended.GPUPIDs)
+	assert.False(t, suspended.CuInterposePrepared)
+
+	_, needsRecovery = SuspendedSourceOf(errors.New("prepare failed"))
+	assert.False(t, needsRecovery, "a failure before the source was touched needs no recovery")
+
+	cpuOnly, needsRecovery := SuspendedSourceOf(sourceNeedsRecovery(errors.New("capture failed"), nil, false, false))
+	assert.True(t, needsRecovery)
+	assert.Empty(t, cpuOnly.GPUPIDs, "a CPU-only capture still needs recovery, with no GPUs to hand back")
+
+	// Multi-GPU preparation removes the tree's shared mappings, which nothing restores.
+	multiGPU, needsRecovery := SuspendedSourceOf(sourceNeedsRecovery(errors.New("capture failed"), []int{41}, true, false))
+	assert.True(t, needsRecovery)
+	assert.True(t, multiGPU.CuInterposePrepared)
+}
+
+// TestCheckpointCommitFailureReleasesOnlySettledFailures drives a completed dump
+// into a failed commit and records what the broker is asked to do next. The dump
+// itself is stubbed: the decision under test is the deferred cleanup's.
+func TestCheckpointCommitFailureReleasesOnlySettledFailures(t *testing.T) {
+	workingDirectory := t.TempDir()
+	t.Chdir(workingDirectory)
+	for _, tc := range []struct {
+		name      string
+		code      pagebroker.Failure_Code
+		wantAbort bool
+	}{
+		{"storage error keeps the staged pages", pagebroker.Failure_STORAGE_ERROR, false},
+		{"outcome unknown keeps the staged pages", pagebroker.Failure_OUTCOME_UNKNOWN, false},
+		{"conflict releases them", pagebroker.Failure_TRANSACTION_CONFLICT, true},
+		{"insufficient storage releases them", pagebroker.Failure_INSUFFICIENT_STORAGE, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listener := listenPageBroker(t)
+			imageDirectory := t.TempDir()
+			cfg := &types.AgentConfig{
+				Storage:    types.StorageSpec{BasePath: t.TempDir()},
+				PageBroker: types.PageBrokerSpec{ControlSocketPath: listener.Addr().String()},
+			}
+			req := CheckpointRequest{ContentUID: "content-uid", ContainerName: "main"}
+			ctx, cancel := context.WithTimeout(context.Background(), pageBrokerTestTimeout)
+			defer cancel()
+
+			seen := make(chan string, 8)
+			served := make(chan error, 1)
+			go func() {
+				for {
+					connection, err := listener.Accept()
+					if err != nil {
+						served <- nil
+						return
+					}
+					request, err := readPageBrokerTestRequest(connection)
+					if err != nil {
+						_ = connection.Close()
+						served <- err
+						return
+					}
+					response := &pagebroker.Response{}
+					switch {
+					case request.GetPrepareStagedCheckpoint() != nil:
+						seen <- "prepare"
+						response.Result = &pagebroker.Response_StagedCheckpointDirectory{
+							StagedCheckpointDirectory: &pagebroker.StagedCheckpointDirectory{ImageDirectory: &imageDirectory},
+						}
+					case request.GetCommit() != nil:
+						seen <- "commit"
+						response.Result = &pagebroker.Response_Failure{Failure: &pagebroker.Failure{
+							Code: tc.code.Enum(), Message: proto.String("commit refused"),
+						}}
+					case request.GetAbort() != nil:
+						seen <- "abort"
+						response.Result = &pagebroker.Response_AbortComplete{AbortComplete: &pagebroker.AbortComplete{}}
+					default:
+						_ = connection.Close()
+						served <- fmt.Errorf("unexpected request %v", request)
+						return
+					}
+					err = replyPageBrokerTest(connection, request, response)
+					_ = connection.Close()
+					if err != nil {
+						served <- err
+						return
+					}
+				}
+			}()
+
+			originalCapture := captureCheckpointFunc
+			t.Cleanup(func() { captureCheckpointFunc = originalCapture })
+			captureCheckpointFunc = func(context.Context, *criurpc.CriuOpts, *types.CRIUSettings, *types.CheckpointManifest,
+				*types.CheckpointContainerSnapshot, string, string, logr.Logger, *pagebroker.CustomStorageExecution,
+			) (*checkpointPhaseTimings, error) {
+				return &checkpointPhaseTimings{}, nil
+			}
+
+			_, err := checkpoint(ctx, nil, logr.Discard(), req, cfg,
+				func(context.Context, snapshotruntime.Runtime, logr.Logger, CheckpointRequest) (*types.CheckpointContainerSnapshot, time.Duration, error) {
+					return &types.CheckpointContainerSnapshot{PID: -1, RootFS: workingDirectory}, 0, nil
+				})
+			require.Equal(t, StepCommitCheckpoint, StepOf(err), "the failure must name the commit step")
+			_ = listener.Close()
+			waitPageBrokerTest(t, served)
+			close(seen)
+
+			var phases []string
+			for phase := range seen {
+				phases = append(phases, phase)
+			}
+			want := []string{"prepare", "commit"}
+			if tc.wantAbort {
+				want = append(want, "abort")
+			}
+			assert.Equal(t, want, phases, "a completed dump must not be released for a retryable failure")
+		})
+	}
+}
+
+// A completed dump whose commit cannot reach the broker must keep its staged
+// pages. The abort runs on its own context, so it would reach the broker even
+// though the capture's is dead — which is what makes releasing here a real risk
+// rather than a theoretical one.
+func TestCheckpointKeepsStagingWhenTheCommitCannotDial(t *testing.T) {
+	workingDirectory := t.TempDir()
+	t.Chdir(workingDirectory)
+	listener := listenPageBroker(t)
+	imageDirectory := t.TempDir()
+	cfg := &types.AgentConfig{
+		Storage:    types.StorageSpec{BasePath: t.TempDir()},
+		PageBroker: types.PageBrokerSpec{ControlSocketPath: listener.Addr().String()},
+	}
+	req := CheckpointRequest{ContentUID: "content-uid", ContainerName: "main"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	seen := make(chan string, 8)
+	served := make(chan error, 1)
+	go func() {
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				served <- nil
+				return
+			}
+			request, err := readPageBrokerTestRequest(connection)
+			if err != nil {
+				_ = connection.Close()
+				served <- err
+				return
+			}
+			response := &pagebroker.Response{}
+			switch {
+			case request.GetPrepareStagedCheckpoint() != nil:
+				seen <- "prepare"
+				response.Result = &pagebroker.Response_StagedCheckpointDirectory{
+					StagedCheckpointDirectory: &pagebroker.StagedCheckpointDirectory{ImageDirectory: &imageDirectory},
+				}
+			case request.GetAbort() != nil:
+				seen <- "abort"
+				response.Result = &pagebroker.Response_AbortComplete{AbortComplete: &pagebroker.AbortComplete{}}
+			default:
+				seen <- "unexpected"
+				response.Result = &pagebroker.Response_AbortComplete{AbortComplete: &pagebroker.AbortComplete{}}
+			}
+			err = replyPageBrokerTest(connection, request, response)
+			_ = connection.Close()
+			if err != nil {
+				served <- err
+				return
+			}
+		}
+	}()
+
+	originalCapture := captureCheckpointFunc
+	t.Cleanup(func() { captureCheckpointFunc = originalCapture })
+	captureCheckpointFunc = func(context.Context, *criurpc.CriuOpts, *types.CRIUSettings, *types.CheckpointManifest,
+		*types.CheckpointContainerSnapshot, string, string, logr.Logger, *pagebroker.CustomStorageExecution,
+	) (*checkpointPhaseTimings, error) {
+		// The dump completes just as the capture's context dies, so the commit
+		// that follows cannot dial.
+		cancel()
+		return &checkpointPhaseTimings{}, nil
+	}
+
+	_, err := checkpoint(ctx, nil, logr.Discard(), req, cfg,
+		func(context.Context, snapshotruntime.Runtime, logr.Logger, CheckpointRequest) (*types.CheckpointContainerSnapshot, time.Duration, error) {
+			return &types.CheckpointContainerSnapshot{PID: -1, RootFS: workingDirectory}, 0, nil
+		})
+	require.Equal(t, StepCommitCheckpoint, StepOf(err), "the failure must name the commit step")
+	_ = listener.Close()
+	waitPageBrokerTest(t, served)
+	close(seen)
+
+	var phases []string
+	for phase := range seen {
+		phases = append(phases, phase)
+	}
+	assert.Equal(t, []string{"prepare"}, phases, "a dump the broker never heard about must not be released")
+}
+
+func TestCheckpointTimingSummarySplitsCUDAAndCRIU(t *testing.T) {
+	imageBytes := int64(7_000_000_000)
+	summary := checkpointTimingSummary(checkpointSummaryInput{
+		Wall:         7289 * time.Millisecond,
+		GPUDeviceMap: 36 * time.Millisecond,
+		Timings: &checkpointPhaseTimings{
+			CUDA: cuda.CheckpointPhaseTimings{
+				PhasesMeasured:  true,
+				LockDuration:    100 * time.Millisecond,
+				CopyDuration:    1500 * time.Millisecond,
+				JobFileDuration: 65 * time.Millisecond,
+				TotalDuration:   1665 * time.Millisecond,
+			},
+			CRIUDumpDuration: 5197 * time.Millisecond,
+			CRIUStats: &criu.DumpStats{
+				Freezing:     12 * time.Millisecond,
+				Frozen:       2 * time.Second,
+				MemDump:      4500 * time.Millisecond,
+				MemWrite:     400 * time.Millisecond,
+				PagesWritten: 100,
+			},
+			CheckpointDirBytesBeforeOverlay: &imageBytes,
+			OverlayCaptureDuration:          343 * time.Millisecond,
+			OverlayDiffBytes:                49 << 20,
+			AccountingDuration:              20 * time.Millisecond,
+		},
+		Switch: 200 * time.Microsecond,
+	})
+
+	phases := summary["phases"].(map[string]string)
+	assert.Equal(t, (5197 * time.Millisecond).String(), phases["criu_dump"])
+	assert.Equal(t, (1665 * time.Millisecond).String(), phases["cuda_checkpoint"])
+	assert.Equal(t, (20 * time.Millisecond).String(), phases["artifact_accounting"])
+
+	cudaFields := summary["cuda"].(map[string]string)
+	assert.Equal(t, (100 * time.Millisecond).String(), cudaFields["lock"])
+	assert.Equal(t, (1500 * time.Millisecond).String(), cudaFields["copy"])
+
+	criuFields := summary["criu"].(map[string]any)
+	assert.Equal(t, (400 * time.Millisecond).String(), criuFields["memwrite"])
+	assert.Equal(t, (4500 * time.Millisecond).String(), criuFields["memdump"])
+	assert.Equal(t, uint64(100)*uint64(os.Getpagesize()), criuFields["pages_written_bytes"])
+	assert.Equal(t, imageBytes, criuFields["checkpoint_dir_bytes_before_overlay"])
+
+	overlay := summary["overlay"].(map[string]any)
+	assert.Equal(t, int64(49<<20), overlay["diff_bytes"])
+}
+
+func TestCheckpointTimingSummaryOmitsUnmeasuredCUDA(t *testing.T) {
+	summary := checkpointTimingSummary(checkpointSummaryInput{
+		Wall: 2 * time.Second,
+		Timings: &checkpointPhaseTimings{
+			CUDA:             cuda.CheckpointPhaseTimings{TotalDuration: 800 * time.Millisecond},
+			CRIUDumpDuration: time.Second,
+		},
+	})
+
+	assert.NotContains(t, summary, "cuda")
+	phases := summary["phases"].(map[string]string)
+	assert.Equal(t, (800 * time.Millisecond).String(), phases["cuda_checkpoint"])
 }

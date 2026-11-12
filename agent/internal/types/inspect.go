@@ -15,6 +15,7 @@ type MountInfo struct {
 	FSType     string
 	VFSOptions string // superblock options (e.g. "upperdir=...")
 	ReadOnly   bool   // per-mount "ro" option, which CRIU reapplies on restore
+	Device     string // "major:minor" of the filesystem; binds of one filesystem share it
 
 	// IsOCIManaged is true when the mount destination matches an OCI spec entry
 	// (including /run/ ↔ /var/run/ aliasing). Set by ClassifyMounts.
@@ -44,10 +45,14 @@ type CheckpointContainerSnapshot struct {
 
 // RestoreContainerSnapshot holds inspected state for the restore target.
 type RestoreContainerSnapshot struct {
-	TargetGPUUUIDs  []string
-	PlaceholderPID  int
-	TargetRoot      string
-	CgroupRoot      string
+	TargetGPUUUIDs []string
+	PlaceholderPID int
+	TargetRoot     string
+	CgroupRoot     string
+	// LSMProfile is the placeholder container's AppArmor profile or SELinux
+	// label, as CRIU's lsm_profile takes it ("apparmor:<name>" or
+	// "selinux:<label>"), or criu.LSMProfileNone ("none:") when it has none.
+	LSMProfile      string
 	CUDADeviceMap   string
 	GPUMountAliases map[string]string
 }

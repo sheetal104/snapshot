@@ -20,6 +20,7 @@ const CheckpointBasePath = "/checkpoints"
 type AgentConfig struct {
 	NodeName               string          `yaml:"-"`
 	HostKernelVersion      string          `yaml:"-"`
+	HostCPUFeatures        []string        `yaml:"-"`
 	CustomStorageAvailable bool            `yaml:"-"`
 	Storage                StorageSpec     `yaml:"storage"`
 	Overlay                OverlaySettings `yaml:"overlay"`
@@ -89,6 +90,11 @@ type PageBrokerSpec struct {
 	// RestoreMode selects the restore source. Empty defaults to direct.
 	RestoreMode       string `yaml:"restoreMode"`
 	ControlSocketPath string `yaml:"controlSocketPath"`
+
+	// StagingPath is the memory-backed volume CRIU writes the image into. The
+	// agent measures it to reject a capture that provably cannot fit; empty
+	// turns that check off, which is what a config predating the field does.
+	StagingPath string `yaml:"stagingPath"`
 }
 
 // DefaultCheckpointTimeoutSeconds bounds a dump for a config written before the field existed.
@@ -102,30 +108,31 @@ const maxTimeoutSeconds = int64(math.MaxInt64) / int64(time.Second)
 
 // CheckpointSpec holds settings for the CRIU dump.
 type CheckpointSpec struct {
-	// A pointer so absent and zero are distinguishable: every config predating this field omits
-	// it, and an agent upgraded ahead of its ConfigMap has to start — with the guard on.
-	CheckpointTimeoutSeconds *int `yaml:"checkpointTimeoutSeconds"`
+	// A pointer so absent and zero are distinguishable: a config predating this field omits it,
+	// as does one still spelling it checkpointTimeoutSeconds, and an agent upgraded ahead of its
+	// ConfigMap has to start — with the guard on.
+	TimeoutSeconds *int `yaml:"timeoutSeconds"`
 }
 
 // CheckpointTimeout bounds one dump, defaulting when the config omits it.
 func (c *CheckpointSpec) CheckpointTimeout() time.Duration {
-	if c.CheckpointTimeoutSeconds == nil {
+	if c.TimeoutSeconds == nil {
 		return DefaultCheckpointTimeoutSeconds * time.Second
 	}
-	return time.Duration(*c.CheckpointTimeoutSeconds) * time.Second
+	return time.Duration(*c.TimeoutSeconds) * time.Second
 }
 
 func (c *CheckpointSpec) Validate() error {
-	if c.CheckpointTimeoutSeconds == nil {
+	if c.TimeoutSeconds == nil {
 		return nil
 	}
-	if *c.CheckpointTimeoutSeconds <= 0 {
-		return &ConfigError{Field: "checkpointTimeoutSeconds", Message: "checkpointTimeoutSeconds must be greater than zero"}
+	if *c.TimeoutSeconds <= 0 {
+		return &ConfigError{Field: "checkpoint.timeoutSeconds", Message: "checkpoint.timeoutSeconds must be greater than zero"}
 	}
-	if int64(*c.CheckpointTimeoutSeconds) > maxTimeoutSeconds {
+	if int64(*c.TimeoutSeconds) > maxTimeoutSeconds {
 		return &ConfigError{
-			Field:   "checkpointTimeoutSeconds",
-			Message: fmt.Sprintf("checkpointTimeoutSeconds must not exceed %d", maxTimeoutSeconds),
+			Field:   "checkpoint.timeoutSeconds",
+			Message: fmt.Sprintf("checkpoint.timeoutSeconds must not exceed %d", maxTimeoutSeconds),
 		}
 	}
 	return nil
@@ -133,7 +140,7 @@ func (c *CheckpointSpec) Validate() error {
 
 // RestoreSpec holds settings for the CRIU restore process.
 type RestoreSpec struct {
-	RestoreTimeoutSeconds int `yaml:"restoreTimeoutSeconds"`
+	TimeoutSeconds int `yaml:"timeoutSeconds"`
 
 	// SkipCompatCheck turns the restore compatibility gate off for every
 	// restore this agent handles. It is the per-node escape hatch, for a
@@ -142,20 +149,20 @@ type RestoreSpec struct {
 }
 
 func (c *RestoreSpec) RestoreTimeout() time.Duration {
-	if c.RestoreTimeoutSeconds <= 0 {
+	if c.TimeoutSeconds <= 0 {
 		return 0
 	}
-	return time.Duration(c.RestoreTimeoutSeconds) * time.Second
+	return time.Duration(c.TimeoutSeconds) * time.Second
 }
 
 func (c *RestoreSpec) Validate() error {
-	if c.RestoreTimeoutSeconds <= 0 {
-		return &ConfigError{Field: "restoreTimeoutSeconds", Message: "restoreTimeoutSeconds must be greater than zero"}
+	if c.TimeoutSeconds <= 0 {
+		return &ConfigError{Field: "restore.timeoutSeconds", Message: "restore.timeoutSeconds must be greater than zero"}
 	}
-	if int64(c.RestoreTimeoutSeconds) > maxTimeoutSeconds {
+	if int64(c.TimeoutSeconds) > maxTimeoutSeconds {
 		return &ConfigError{
-			Field:   "restoreTimeoutSeconds",
-			Message: fmt.Sprintf("restoreTimeoutSeconds must not exceed %d", maxTimeoutSeconds),
+			Field:   "restore.timeoutSeconds",
+			Message: fmt.Sprintf("restore.timeoutSeconds must not exceed %d", maxTimeoutSeconds),
 		}
 	}
 	return nil

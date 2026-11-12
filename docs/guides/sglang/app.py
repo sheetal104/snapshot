@@ -1,6 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
+
+# The benchmark wrapper supplies these hooks. Normal guide runs need no helper files.
+phase = globals().get("benchmark_phase", lambda _: nullcontext())
+mark = globals().get("benchmark_mark", lambda _: None)
+benchmark_token = globals().get("benchmark_token")
+
 import argparse
 import json
 import os
@@ -16,14 +23,14 @@ CONTROL_DIR = Path(os.environ.get("SNAPSHOT_CONTROL_DIR", "/snapshot-control"))
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("prime", "snapshot"), default="snapshot")
+    # JSON keys are Engine API keyword arguments, not CLI flags.
+    parser.add_argument("engine_args", type=json.loads)
     return parser.parse_args()
 
 
 def configure_capture_environment() -> None:
     os.environ.update(
         {
-            "NCCL_CUMEM_ENABLE": "0",
-            "NCCL_NVLS_ENABLE": "0",
             "NCCL_IB_DISABLE": "1",
             "NCCL_RAS_ENABLE": "0",
             "TORCH_NCCL_ENABLE_MONITORING": "0",
@@ -33,30 +40,32 @@ def configure_capture_environment() -> None:
     )
 
 
-def create_engine(snapshot_mode: bool) -> Any:
+def create_engine(overrides: dict[str, Any], snapshot_mode: bool) -> Any:
     import sglang as sgl
 
-    return sgl.Engine(
-        model_path=os.environ["SNAPSHOT_MODEL"],
-        context_length=int(os.environ.get("SGLANG_CONTEXT_LENGTH", "10240")),
-        page_size=int(os.environ.get("SGLANG_PAGE_SIZE", "16")),
-        tp_size=1,
-        trust_remote_code=False,
-        enable_memory_saver=snapshot_mode,
-        enable_weights_cpu_backup=snapshot_mode,
-        log_level="info",
-    )
+    engine_args = {
+        "context_length": int(os.environ.get("SGLANG_CONTEXT_LENGTH", "10240")),
+        "page_size": int(os.environ.get("SGLANG_PAGE_SIZE", "16")),
+        "trust_remote_code": False,
+        "log_level": "info",
+        **overrides,
+        # Capture releases KV through the memory saver and keeps no CPU weight copy.
+        "enable_memory_saver": snapshot_mode,
+        "enable_weights_cpu_backup": False,
+    }
+    return sgl.Engine(**engine_args)
 
 
 def generate_text(engine: Any, prompt: str) -> str:
-    result = engine.generate(
-        prompt,
-        sampling_params={"temperature": 0, "max_new_tokens": 16},
-    )
-    text = result.get("text", "").strip()
-    if not text:
-        raise RuntimeError("SGLang produced empty output")
-    return text
+    with phase("generation"):
+        result = engine.generate(
+            prompt,
+            sampling_params={"temperature": 0, "max_new_tokens": 16},
+        )
+        text = result.get("text", "").strip()
+        if not text:
+            raise RuntimeError("SGLang produced empty output")
+        return text
 
 
 def pause_generation(engine: Any) -> None:
@@ -71,7 +80,9 @@ def pause_generation(engine: Any) -> None:
     # stale last_batch and the release fails with "should be called only when
     # server is idle" (SGLang 0.5.17).
     engine.loop.run_until_complete(
-        engine.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="retract"))
+        engine.tokenizer_manager.pause_generation(
+            PauseGenerationReqInput(mode="retract")
+        )
     )
 
 
@@ -104,7 +115,14 @@ def serve_api(engine: Any, restored_text: str) -> None:
                 self.send_error(500, str(error))
                 return
 
-            body = json.dumps({"text": text}).encode()
+            body = json.dumps(
+                {
+                    "text": text,
+                    **(
+                        {"checkpoint_token": benchmark_token} if benchmark_token else {}
+                    ),
+                }
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -127,17 +145,36 @@ def main() -> None:
         configure_capture_environment()
         CONTROL_DIR.joinpath("ready-for-snapshot").unlink(missing_ok=True)
 
-    engine = create_engine(snapshot_mode)
+    mark("engine_init_begin")
+    engine = create_engine(args.engine_args, snapshot_mode)
+    mark("engine_init_end")
     try:
         text = generate_text(engine, "The capital city of France is")
         print(f"SGLang pre-checkpoint output={text!r}", flush=True)
+        mark("first_inference_complete")
+        if benchmark_token:
+            for prompt, expected in [
+                ("The capital city of France is", "paris"),
+                ("The capital city of Germany is", "berlin"),
+                ("The capital city of Japan is", "tokyo"),
+            ]:
+                answer = generate_text(engine, prompt)
+                print(
+                    "CR_SEMANTIC_PRECHECK "
+                    + json.dumps(dict(expected=expected, answer=answer)),
+                    flush=True,
+                )
+                if expected not in answer.lower():
+                    raise RuntimeError("Source inference check failed: " + repr(answer))
 
         if not snapshot_mode:
             return
 
-        pause_generation(engine)
+        with phase("pause_generation"):
+            pause_generation(engine)
         try:
-            engine.release_memory_occupation()
+            with phase("release_kv_cache"):
+                engine.release_memory_occupation(tags=["kv_cache"])
         except BaseException:
             continue_generation(engine)
             raise
@@ -150,14 +187,16 @@ def main() -> None:
         while not CONTROL_DIR.joinpath("restore-complete").exists():
             time.sleep(1)
 
-        # The restored process keeps the source container's stdout, which is
-        # gone; a failure here would otherwise be invisible. Record it in the
-        # control directory next to the success sentinel.
+        # The restore connects this process's output to the restore
+        # container's log. Also record a failure in the control directory,
+        # next to the success sentinel, where tools can read it.
         try:
             progress = CONTROL_DIR.joinpath("sglang-restore-progress")
-            engine.resume_memory_occupation()
+            with phase("wake"):
+                engine.resume_memory_occupation(tags=["kv_cache"])
             progress.write_text("memory-resumed\n", encoding="utf-8")
-            continue_generation(engine)
+            with phase("resume_generation"):
+                continue_generation(engine)
             progress.write_text("generation-continued\n", encoding="utf-8")
 
             text = generate_text(engine, "The capital city of Germany is")

@@ -4,14 +4,72 @@
 package executor
 
 import (
+	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/go-logr/logr"
 
+	"github.com/ai-dynamo/snapshot/agent/internal/criu"
+	"github.com/ai-dynamo/snapshot/agent/internal/cuda"
 	"github.com/ai-dynamo/snapshot/agent/internal/types"
 	"github.com/ai-dynamo/snapshot/api/compat"
 	"github.com/ai-dynamo/snapshot/api/podcontract"
 )
+
+// refuseMIGCapture fails a checkpoint of a container on a MIG slice. It runs
+// before anything is locked, so the workload keeps serving.
+func refuseMIGCapture(log logr.Logger, pid int, visible cuda.VisibleGPULister) error {
+	migSlices := visibleMIGSlices(log, pid, visible)
+	if len(migSlices) == 0 {
+		return nil
+	}
+	return fmt.Errorf("refused as incompatible: %s: the container holds MIG slice %s, and Snapshot supports whole GPUs only",
+		compat.CheckMIGSlice, strings.Join(migSlices, ", "))
+}
+
+// refuseMIGRestore is the inspect gate's MIG rule. It cannot wait for
+// inspectCompatibility, which takes the target GPUs that discovery would first
+// fail to read or misreport on a slice.
+func refuseMIGRestore(log logr.Logger, pid int, visible cuda.VisibleGPULister, skipCompatCheck bool) error {
+	if skipCompatCheck {
+		return nil
+	}
+	migSlices := visibleMIGSlices(log, pid, visible)
+	if len(migSlices) == 0 {
+		return nil
+	}
+	return compat.NewIncompatibleError(compat.GateInspect, []compat.Mismatch{{
+		Check:  compat.CheckMIGSlice,
+		Source: "whole GPU",
+		Target: "MIG slice " + strings.Join(migSlices, ", "),
+	}})
+}
+
+// refuseUnlabeledRestore is the inspect gate's security label rule. It reads
+// only the manifest, and the compatibility bypass does not waive it.
+func refuseUnlabeledRestore(manifest *types.CheckpointManifest, lsmProfile string) error {
+	if lsmProfile == criu.LSMProfileNone || manifest.CRIUDump.LSMLabels {
+		return nil
+	}
+	return compat.NewIncompatibleError(compat.GateInspect, []compat.Mismatch{{
+		Check:  compat.CheckLSMLabels,
+		Source: "no recorded process labels",
+		Target: lsmProfile,
+	}})
+}
+
+// visibleMIGSlices treats a container whose slices cannot be listed as holding
+// whole GPUs. A real slice still fails the capture or restore, only later and
+// less legibly.
+func visibleMIGSlices(log logr.Logger, pid int, visible cuda.VisibleGPULister) []string {
+	listed, err := visible()
+	if err != nil {
+		log.V(1).Info("Failed to list MIG slices; treating the GPUs as whole", "pid", pid, "error", err)
+		return nil
+	}
+	return listed.MIGSlices
+}
 
 // inspectCompatibility runs the inspect gate for one restore, the counterpart of
 // the controller's preflightCompatibility. A nil error means the restore may go

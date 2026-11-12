@@ -8,6 +8,7 @@ import (
 	"errors"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
@@ -16,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/ai-dynamo/snapshot/agent/internal/executor"
+	"github.com/ai-dynamo/snapshot/agent/internal/pagebroker"
 	snapshotruntime "github.com/ai-dynamo/snapshot/agent/internal/runtime"
 	"github.com/ai-dynamo/snapshot/agent/internal/types"
 	"github.com/ai-dynamo/snapshot/api/compat"
@@ -69,11 +71,104 @@ func TestPreflightCompatibilityComparesTheRecordedEnvironment(t *testing.T) {
 	assert.Equal(t, []string{"/etc/hosts", "/model-cache"}, r.comparison.calls[0].source.ExternalizedMounts)
 }
 
+// Bound content has no local manifest path; the gate fetches it from
+// PageBroker the same way the restore path itself does, so a bound checkpoint
+// gets the same preflight scrutiny as a legacy one.
+func TestPreflightCompatibilityFetchesTheManifestForBoundContentFromPageBroker(t *testing.T) {
+	r := newGatedRestore(t)
+	artifact := &pagebroker.PublishedArtifact{StoreId: "store-a", ArtifactHandle: "artifacts/mounted-content/containers/" + gatedRestoreContainer}
+	manifest := &types.CheckpointManifest{
+		Artifact: types.ArtifactManifest{ContentUID: "mounted-content", ContainerName: gatedRestoreContainer},
+		CRIUDump: types.CRIUDumpManifest{
+			ExtMnt: map[string]string{"/model-cache": "/model-cache"},
+		},
+	}
+	var requested *pagebroker.PublishedArtifact
+	r.controller.fetchManifestFn = func(_ context.Context, a *pagebroker.PublishedArtifact) (*types.CheckpointManifest, error) {
+		requested = a
+		return manifest, nil
+	}
+
+	err := r.controller.preflightCompatibility(context.Background(), r.pod, &restoreArtifact{
+		SourceContainerName: gatedRestoreContainer,
+		PublishedArtifact:   artifact,
+	}, gatedRestoreMappings(), false)
+
+	require.NoError(t, err)
+	assert.Same(t, artifact, requested)
+	require.Len(t, r.comparison.calls, 1)
+	assert.Equal(t, compat.GatePreflight, r.comparison.calls[0].gate)
+	assert.Equal(t, []string{"/model-cache"}, r.comparison.calls[0].source.ExternalizedMounts)
+}
+
+// A broker that accepts the metadata request and never answers must not hold
+// the restore worker: the preflight fetch runs under its own deadline.
+func TestPreflightCompatibilityBoundsTheManifestFetch(t *testing.T) {
+	r := newGatedRestore(t)
+	var deadline time.Time
+	var hasDeadline bool
+	r.controller.fetchManifestFn = func(ctx context.Context, _ *pagebroker.PublishedArtifact) (*types.CheckpointManifest, error) {
+		deadline, hasDeadline = ctx.Deadline()
+		return nil, errors.New("no reply from PageBroker")
+	}
+
+	err := r.controller.preflightCompatibility(context.Background(), r.pod, &restoreArtifact{
+		SourceContainerName: gatedRestoreContainer,
+		PublishedArtifact:   &pagebroker.PublishedArtifact{StoreId: "store-a", ArtifactHandle: "artifacts/mounted-content/containers/" + gatedRestoreContainer},
+	}, gatedRestoreMappings(), false)
+
+	require.NoError(t, err)
+	require.True(t, hasDeadline)
+	assert.WithinDuration(t, time.Now().Add(restorePreflightManifestTimeout), deadline, 5*time.Second)
+}
+
+// This is the regression the gate exists to catch: a bound capture restored
+// into less memory than it was taken with has to be refused before any CRIU
+// work, exactly like a legacy one.
+func TestPreflightCompatibilityRefusesBoundContentOnMismatch(t *testing.T) {
+	mismatch := compat.Mismatch{Check: "memory-limit", Source: "32Gi", Target: "1Gi"}
+	r := newGatedRestore(t, mismatch)
+	r.controller.fetchManifestFn = func(context.Context, *pagebroker.PublishedArtifact) (*types.CheckpointManifest, error) {
+		return &types.CheckpointManifest{
+			Artifact: types.ArtifactManifest{ContentUID: "mounted-content", ContainerName: gatedRestoreContainer},
+		}, nil
+	}
+
+	err := r.controller.preflightCompatibility(context.Background(), r.pod, &restoreArtifact{
+		SourceContainerName: gatedRestoreContainer,
+		PublishedArtifact:   &pagebroker.PublishedArtifact{StoreId: "store-a", ArtifactHandle: "artifacts/mounted-content/containers/" + gatedRestoreContainer},
+	}, gatedRestoreMappings(), false)
+
+	var incompatible *compat.IncompatibleError
+	require.ErrorAs(t, err, &incompatible)
+	assert.Equal(t, []compat.Mismatch{mismatch}, incompatible.Mismatches)
+}
+
+// A bound artifact PageBroker cannot (yet) produce a manifest for is treated
+// the same as an unreadable local one: not an incompatibility, since the
+// restore path itself reports the real error.
+func TestPreflightCompatibilityAllowsAnUnreachableBoundManifest(t *testing.T) {
+	r := newGatedRestore(t, compat.Mismatch{Check: "kernel-version"})
+	r.controller.fetchManifestFn = func(context.Context, *pagebroker.PublishedArtifact) (*types.CheckpointManifest, error) {
+		return nil, errors.New("artifact not found")
+	}
+
+	err := r.controller.preflightCompatibility(context.Background(), r.pod, &restoreArtifact{
+		SourceContainerName: gatedRestoreContainer,
+		PublishedArtifact:   &pagebroker.PublishedArtifact{StoreId: "store-a", ArtifactHandle: "artifacts/mounted-content/containers/" + gatedRestoreContainer},
+	}, gatedRestoreMappings(), false)
+
+	require.NoError(t, err)
+	assert.Empty(t, r.comparison.calls, "comparison ran without a manifest")
+	require.Len(t, r.events(t, restoreCompatUncheckedReason), 1)
+}
+
 // The gate compares the checkpoint against every destination, so each target
 // side has to describe this node and its destination container.
 func TestPreflightCompatibilityDescribesEveryRestoreTarget(t *testing.T) {
 	r := newGatedRestore(t)
 	r.controller.config.HostKernelVersion = "5.15.0-1071-aws"
+	r.controller.config.HostCPUFeatures = []string{"avx2", "sse2"}
 	r.pod.Spec.Containers[0].Image = "nvcr.io/nvidia/tritonserver:24.09-py3"
 	r.pod.Status.ContainerStatuses[0].ImageID = "sha256:deadbeef"
 	r.pod.Spec.Containers = append(r.pod.Spec.Containers, corev1.Container{
@@ -95,13 +190,67 @@ func TestPreflightCompatibilityDescribesEveryRestoreTarget(t *testing.T) {
 	assert.Equal(t, compat.Environment{
 		CPUArch:       runtime.GOARCH,
 		KernelVersion: "5.15.0-1071-aws",
+		CPUFeatures:   []string{"avx2", "sse2"},
 		Image:         "nvcr.io/nvidia/tritonserver:24.09-py3",
 	}, r.comparison.calls[0].target)
 	assert.Equal(t, compat.Environment{
 		CPUArch:       runtime.GOARCH,
 		KernelVersion: "5.15.0-1071-aws",
+		CPUFeatures:   []string{"avx2", "sse2"},
 		Image:         "nvcr.io/nvidia/tritonserver:25.01-py3",
 	}, r.comparison.calls[1].target)
+}
+
+// The rule is tested in api/compat. This runs it through the gate, so the two
+// sides it compares are what the checkpoint recorded and what this agent read
+// at startup.
+func TestPreflightRefusesACPUMissingAnInstructionSet(t *testing.T) {
+	for name, tc := range map[string]struct {
+		recorded []string
+		offered  []string
+		missing  string
+	}{
+		"the target lacks one the source had": {
+			recorded: []string{"avx2", "avx512f", "sse2"},
+			offered:  []string{"avx2", "sse2"},
+			missing:  "avx512f",
+		},
+		"the target offers more": {
+			recorded: []string{"sse2"},
+			offered:  []string{"avx2", "sse2"},
+		},
+		"a checkpoint that recorded none": {
+			offered: []string{"avx2", "sse2"},
+		},
+		"a node that could not read its own": {
+			recorded: []string{"avx512f"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newGatedRestore(t)
+			r.controller.compareFn = compat.Compare
+			r.controller.config.HostCPUFeatures = tc.offered
+			path := writeTestArtifact(t, r.controller.config.Storage.BasePath, "cpu-content", &types.CheckpointManifest{
+				Artifact: types.ArtifactManifest{ContentUID: "cpu-content", ContainerName: gatedRestoreContainer},
+				Host:     types.NewHostManifest(r.controller.config.HostKernelVersion, tc.recorded),
+			})
+
+			err := r.controller.preflightCompatibility(context.Background(), r.pod, &restoreArtifact{
+				SourceContainerName: gatedRestoreContainer,
+				Path:                path,
+			}, gatedRestoreMappings(), false)
+
+			if tc.missing == "" {
+				require.NoError(t, err)
+				return
+			}
+			var incompatible *compat.IncompatibleError
+			require.ErrorAs(t, err, &incompatible)
+			assert.Equal(t, []compat.Mismatch{
+				{Check: compat.CheckCPUFeatures, Source: tc.missing, Target: "missing"},
+			}, incompatible.Mismatches)
+		})
+	}
 }
 
 // The refusal event is its own reason, so alerting that pages on restore

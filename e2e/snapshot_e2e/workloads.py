@@ -22,10 +22,34 @@ SOURCE_READY = f"{CONTROL_DIR}/ready-for-snapshot"
 # depend on it.
 SNAPSHOT_COMPLETE = f"{CONTROL_DIR}/snapshot-complete"
 RESTORE_DONE = f"{CONTROL_DIR}/restore-complete"
+# The agent's NRI plugin makes the restore proxy PID 1 in restore containers,
+# in place of the container's command.
+RESTORE_PROXY = f"{CONTROL_DIR}/snapshot-restore-proxy"
+# The command restore containers need on nodes without the restore proxy.
+INERT_COMMAND = ["sleep", "infinity"]
+# The process the CUDA workload runs as, from CUDA_SOURCE.
+CUDA_HOLD = "/tmp/cuda_hold"
 RESTORE_INITIAL_TOKEN = f"{CONTROL_DIR}/initial-restore-token"
+HELPER_SYNC_DIR = "/e2e-helper-sync"
 STATE_DIR = "/tmp/e2e-state"
 FILE_TOKEN = f"{STATE_DIR}/file-token"
 OBSERVATIONS = f"{STATE_DIR}/observations.log"
+# The CPU loop exits with the code written here, so a test can end it.
+EXIT_REQUEST = f"{STATE_DIR}/exit-request"
+# The CPU loop exits with this code on SIGTERM, when a test asks for it.
+SIGTERM_EXIT = 42
+# Lifecycle hook tests: the source never writes CHECKPOINT_READY itself, so a
+# checkpoint readiness probe on it holds the checkpoint until the test does.
+CHECKPOINT_READY = f"{STATE_DIR}/checkpoint-ready"
+HOOKS_PORT = 8000
+# The source names HOOKS_PORT, so a test can address it by name.
+HOOKS_PORT_NAME = "hooks"
+HOOKS_STATUS_PATH = "/checkpoint/status"
+HOOKS_RESUME_PATH = "/checkpoint/resume"
+# Post-restore tests: an emptyDir per container, so the marker is never
+# carried over from the source and fan-out copies don't share one.
+RELEASE_DIR = "/app-release"
+RELEASE_MARKER = f"{RELEASE_DIR}/released"
 SOURCE_TOKEN_ENV = "SNAPSHOT_E2E_SOURCE_TOKEN"
 RESTORE_TOKEN_ENV = "SNAPSHOT_E2E_RESTORE_TOKEN"
 
@@ -69,6 +93,8 @@ def source_pod(
     gpu: bool,
     annotations: dict[str, str] | None = None,
     memory_limit: str | None = None,
+    handle_sigterm: bool = False,
+    hooks_server: bool = False,
 ) -> dict[str, Any]:
     metadata = {
         "name": run.source_pod,
@@ -76,10 +102,18 @@ def source_pod(
         "labels": run.labels,
         "annotations": annotations or {},
     }
-    spec = base_pod_spec(config, run, source_command(run.image, gpu), gpu, memory_limit)
+    spec = base_pod_spec(
+        config,
+        run,
+        source_command(run.image, gpu, handle_sigterm=handle_sigterm, hooks_server=hooks_server),
+        gpu,
+        memory_limit,
+    )
     spec["containers"][0]["env"] = [
         {"name": SOURCE_TOKEN_ENV, "value": run.source_token},
     ]
+    if hooks_server:
+        spec["containers"][0]["ports"] = [{"name": HOOKS_PORT_NAME, "containerPort": HOOKS_PORT}]
     return {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -138,7 +172,7 @@ def restore_pod(
     # snapshot_name defaults to the lifecycle flow's test-created PodSnapshot
     # (run.snapshot_name); a SnapshotJob-produced PodSnapshot is named after
     # the SnapshotJob instead, so those tests pass it explicitly.
-    spec = base_pod_spec(config, run, restore_command(run.image, gpu), gpu, memory_limit)
+    spec = base_pod_spec(config, run, RESTORE_COMMAND, gpu, memory_limit)
     spec["securityContext"] = {
         "seccompProfile": {
             "type": "Localhost",
@@ -146,7 +180,6 @@ def restore_pod(
         }
     }
     spec["containers"][0]["env"] = [
-        {"name": "SNAPSHOT_RESTORE_STANDBY", "value": "1"},
         {"name": "SNAPSHOT_CONTROL_DIR", "value": CONTROL_DIR},
         {"name": RESTORE_TOKEN_ENV, "value": run.restore_token},
     ]
@@ -174,6 +207,17 @@ def restore_pod(
     }
 
 
+def add_release_dir(pod: dict[str, Any]) -> dict[str, Any]:
+    """Mount an emptyDir at RELEASE_DIR in every container, one subPath each."""
+    spec = pod["spec"]
+    spec["volumes"].append({"name": "app-release", "emptyDir": {}})
+    for container in spec["containers"]:
+        container.setdefault("volumeMounts", []).append(
+            {"name": "app-release", "mountPath": RELEASE_DIR, "subPath": container["name"]}
+        )
+    return pod
+
+
 def multi_restore_pod(
     *,
     config: k8s.E2EConfig,
@@ -185,7 +229,7 @@ def multi_restore_pod(
         destination: f"{run.restore_token}-{destination}"
         for destination in destinations
     }
-    spec = base_pod_spec(config, run, restore_command(run.image, False), False)
+    spec = base_pod_spec(config, run, RESTORE_COMMAND, False)
     spec["securityContext"] = {
         "seccompProfile": {
             "type": "Localhost",
@@ -206,7 +250,6 @@ def multi_restore_pod(
                 }
             ],
             "env": [
-                {"name": "SNAPSHOT_RESTORE_STANDBY", "value": "1"},
                 {"name": "SNAPSHOT_CONTROL_DIR", "value": CONTROL_DIR},
                 {"name": RESTORE_TOKEN_ENV, "value": restore_tokens[destination]},
             ],
@@ -255,6 +298,8 @@ def base_pod_spec(
     # agent's own pod, not the workload pod — see checkpoint_agent_pod() /
     # checkpoint_artifact_path() in lifecycle.py), a real caller's pod no
     # longer needs to carry this volume at all.
+    if gpu and config.cpu_only:
+        raise ValueError("GPU workloads cannot run in CPU-only E2E mode")
     container: dict[str, Any] = {
         "name": CONTAINER,
         "image": run.image,
@@ -283,7 +328,7 @@ def base_pod_spec(
         # Kubernetes default 30s graceful termination window between tests.
         "terminationGracePeriodSeconds": 1,
         "containers": [container],
-        **workload_scheduling(),
+        **workload_scheduling(cpu_only=config.cpu_only),
         "volumes": volumes,
     }
     if gpu:
@@ -295,12 +340,31 @@ def base_pod_spec(
     return spec
 
 
-def workload_scheduling() -> dict[str, Any]:
+def restore_proxy() -> bool:
+    """Whether the agents restore through the restore proxy.
+
+    SNAPSHOT_E2E_RESTORE_PROXY=false is for nodes without NRI v0.10 or newer,
+    where the agent restores without it. For auto, see
+    lifecycle.restore_proxy_on.
+    """
+    return os.environ.get("SNAPSHOT_E2E_RESTORE_PROXY", "true") != "false"
+
+
+def workload_scheduling(*, cpu_only: bool | None = None) -> dict[str, Any]:
+    if cpu_only is None:
+        cpu_only = k8s.cpu_only_mode()
+    hostname = os.environ.get("SNAPSHOT_E2E_NODE_HOSTNAME", "").strip()
+    if cpu_only:
+        if not hostname:
+            return {}
+        return {"nodeSelector": {"kubernetes.io/hostname": hostname}}
     # Keep all workload pods on GPU nodes so the shared RWO checkpoint PVC binds in
     # a zone where both source and restore pods can schedule.
     node_selector = {
         "nvidia.com/gpu.present": "true",
     }
+    if hostname:
+        node_selector["kubernetes.io/hostname"] = hostname
     if os.environ.get("SNAPSHOT_E2E_AVOID_MIG") == "true":
         # Opt-in for clusters that serve both MIG-capable and non-MIG GPU pools,
         # where preflight also pins the non-MIG pool. Clusters that do not expose
@@ -354,12 +418,69 @@ def same_node_affinity(node: str) -> dict[str, Any]:
     }
 
 
-def source_command(image: str, gpu: bool) -> str:
+def source_command(image: str, gpu: bool, *, handle_sigterm: bool = False, hooks_server: bool = False) -> str:
+    # handle_sigterm makes the CPU loop exit with SIGTERM_EXIT on SIGTERM. Off
+    # by default, so every other test keeps a workload that only SIGKILL ends.
+    if handle_sigterm and gpu:
+        raise ValueError("only the CPU loop handles SIGTERM")
     state_loop = CUDA_SOURCE if gpu else CPU_SOURCE
+    on_sigterm = f"trap 'exit {SIGTERM_EXIT}' TERM\n" if handle_sigterm else ""
+    server = ""
+    if hooks_server:
+        if gpu:
+            raise ValueError("the lifecycle hooks server runs only in the CPU source")
+        server = HOOKS_SERVER
     return f"""set -euo pipefail
 echo "[source] image={image}"
 mkdir -p {STATE_DIR}
-{state_loop}
+{on_sigterm}{server}{state_loop}
+"""
+
+
+# HOOKS_SERVER answers the HTTP lifecycle hooks from inside the checkpointed
+# process tree, so a test also shows that its listening socket survives
+# restore at a new Pod IP. It is Perl because the workload image has Perl but
+# no Python, nc or socat; a missing perl fails the test instead of skipping it.
+# The source waits for the server to listen, so a server that can't bind its
+# port fails the source at once instead of the probe timing out.
+# SNAPSHOT_E2E_HOOKS_PORT lets the cluster-free test pick a free port.
+HOOKS_SERVER = f"""command -v perl >/dev/null || {{ echo "[source] perl is missing; the lifecycle hooks server needs it" >&2; exit 1; }}
+cat > /tmp/hooks-server.pl <<'PERL_EOF'
+use strict;
+use warnings;
+use IO::Socket::INET;
+my $port = $ENV{{SNAPSHOT_E2E_HOOKS_PORT}} || {HOOKS_PORT};
+my $server = IO::Socket::INET->new(LocalAddr => "0.0.0.0", LocalPort => $port, Listen => 16, ReuseAddr => 1)
+  or die "[hooks] listen on $port: $!\\n";
+$SIG{{PIPE}} = "IGNORE";
+$| = 1;
+print "[hooks] listening on $port\\n";
+open(my $ready, ">", "/tmp/hooks-server.ready") or die "[hooks] ready file: $!\\n";
+close $ready;
+while (my $conn = $server->accept) {{
+  my $request = <$conn> // "";
+  while (my $header = <$conn>) {{ last if $header =~ /^\\r?\\n$/; }}
+  my ($method, $path) = split / /, $request;
+  my $code = 404;
+  if (($method // "") eq "GET" && ($path // "") eq "{HOOKS_STATUS_PATH}") {{
+    $code = -e "{CHECKPOINT_READY}" ? 200 : 503;
+  }} elsif (($method // "") eq "POST" && ($path // "") eq "{HOOKS_RESUME_PATH}") {{
+    # The application's notification: leave the same marker a file action would.
+    if (open(my $marker, ">", "{RELEASE_MARKER}")) {{ close $marker; $code = 204; }} else {{ $code = 500; }}
+  }}
+  print $conn "HTTP/1.1 $code Hook\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n";
+  close $conn;
+}}
+PERL_EOF
+rm -f /tmp/hooks-server.ready
+perl /tmp/hooks-server.pl &
+hooks_pid=$!
+for _ in $(seq 50); do
+  [ -e /tmp/hooks-server.ready ] && break
+  kill -0 "$hooks_pid" 2>/dev/null || {{ echo "[source] the lifecycle hooks server failed to start" >&2; exit 1; }}
+  sleep 0.1
+done
+[ -e /tmp/hooks-server.ready ] || {{ echo "[source] the lifecycle hooks server did not listen within 5 s" >&2; exit 1; }}
 """
 
 
@@ -382,18 +503,47 @@ def snapshotjob_helper_pod_template(
     config: k8s.E2EConfig,
     run: TestRun,
     helper_command: str,
+    wait_for_helper_before_capture: bool = False,
+    wait_for_capture_release: bool = False,
 ) -> dict[str, Any]:
     # Two containers: the CRIU target plus a helper doing independent work
     # (the design's GMS-saver pattern). The dump kills only the target; the
     # SnapshotJob must wait for the helper before completing, and a helper
     # failure must fail the run even though the capture succeeded.
     template = snapshotjob_pod_template(config=config, run=run, gpu=False)
+    if wait_for_helper_before_capture or wait_for_capture_release:
+        waits = []
+        if wait_for_helper_before_capture:
+            waits.append(f"while [ ! -f {HELPER_SYNC_DIR}/helper-finished ]; do sleep 0.1; done")
+            # The fail-capture hook is triggered by container readiness, so
+            # retain this gate until the helper has completed.
+            template["spec"]["containers"][0]["readinessProbe"] = {
+                "exec": {"command": ["cat", f"{HELPER_SYNC_DIR}/helper-finished"]},
+                "periodSeconds": 1,
+            }
+        if wait_for_capture_release:
+            waits.append(f"while [ ! -f {HELPER_SYNC_DIR}/capture-release ]; do sleep 0.1; done")
+        template["spec"]["containers"][0]["command"] = [
+            "/bin/bash",
+            "-lc",
+            f"""set -euo pipefail
+mkdir -p {STATE_DIR}
+{chr(10).join(waits)}
+{CPU_SOURCE}
+""",
+        ]
+    template["spec"]["volumes"].append({"name": "e2e-helper-sync", "emptyDir": {}})
+    for container in template["spec"]["containers"]:
+        container.setdefault("volumeMounts", []).append(
+            {"name": "e2e-helper-sync", "mountPath": HELPER_SYNC_DIR}
+        )
     template["spec"]["containers"].append(
         {
             "name": "helper",
             "image": run.image,
             "imagePullPolicy": "IfNotPresent",
             "command": ["/bin/bash", "-lc", helper_command],
+            "volumeMounts": [{"name": "e2e-helper-sync", "mountPath": HELPER_SYNC_DIR}],
         }
     )
     return template
@@ -431,25 +581,10 @@ def snapshotjob_exit_pod_template(
     return {"metadata": {"labels": {**run.labels}}, "spec": spec}
 
 
-def restore_command(image: str, gpu: bool) -> str:
-    # Restore starts from a live placeholder container. The agent nsenters into
-    # it later, so this command may run briefly; record the initial restore token
-    # and then wait for restore-complete. The agent may start restore soon after
-    # the placeholder starts, so use an init container if this pre-restore write
-    # ever needs to be guaranteed.
-    return f"""set -euo pipefail
-echo "[restore] image={image}"
-restore_token="${{{RESTORE_TOKEN_ENV}}}"
-echo "[restore] initial_restore_token=$restore_token"
-printf '%s\\n' "$restore_token" > {RESTORE_INITIAL_TOKEN}
-echo "[restore] waiting for restore-complete"
-while [ ! -f {RESTORE_DONE} ]; do sleep 1; done
-echo "[restore] restore-complete"
-test -f {FILE_TOKEN}
-test -s {OBSERVATIONS}
-cat {OBSERVATIONS}
-sleep infinity
-"""
+# The agent's NRI plugin replaces the restore container's command with the
+# restore proxy. Agents from before the proxy, in upgrade tests, and nodes
+# without it restore into the running container instead, so the command idles.
+RESTORE_COMMAND = "exec sleep infinity\n"
 
 
 # CPU_SOURCE stores one token in two places: a shell variable, which is process
@@ -466,8 +601,12 @@ unset {SOURCE_TOKEN_ENV}
 printf '%s\\n' "$cpu_token" > {FILE_TOKEN}
 seq=0
 while true; do
+  if [ -f {EXIT_REQUEST} ]; then
+    exit "$(cat {EXIT_REQUEST})"
+  fi
   file_token="$(cat {FILE_TOKEN} 2>/dev/null || true)"
   printf 'observation seq=%s cpu=%s file=%s gpu=disabled\\n' "$seq" "$cpu_token" "$file_token" >> {OBSERVATIONS}
+  echo "[source] observation seq=$seq"
   if [ "$seq" -eq 0 ]; then
     echo ready > {SOURCE_READY}
   fi
@@ -584,6 +723,6 @@ int main(void) {{
   }}
 }}
 C_EOF
-cc /tmp/cuda_hold.c -ldl -o /tmp/cuda_hold
-exec /tmp/cuda_hold
+cc /tmp/cuda_hold.c -ldl -o {CUDA_HOLD}
+exec {CUDA_HOLD}
 """

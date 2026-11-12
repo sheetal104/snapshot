@@ -12,21 +12,26 @@ driven by the guide's own program and manifests (see framework_workloads):
    is checkpointable.
 2. A PodSnapshot captures it. The dump terminates the source process.
 3. A restore pod built from the guide's restore manifest is pinned to the
-   source node. Its own entrypoint stays inert (`sleep infinity`); the agent
+   source node. The restore proxy replaces its entrypoint; the agent
    restores the checkpointed process into it, which resumes the engine,
    generates again, and serves /generate.
 4. The test asserts the restore condition, the restore-ready file, a live
-   /generate answer, and that the placeholder never loaded a model itself —
+   /generate answer, and that the container never loaded a model itself —
    a restore that silently degraded to a cold start must not pass.
 
 Select frameworks with SNAPSHOT_E2E_FRAMEWORK=vllm[,sglang,...]; CI runs one
-per matrix job. Point SNAPSHOT_E2E_FRAMEWORK_IMAGE at a local build to test an
+per matrix job. With SNAPSHOT_E2E_STORAGE=s3, Snapshot is installed against an
+S3-compatible store (snapshot_e2e.s3) instead of the checkpoint volume: the
+checkpoint is checked in the PodSnapshotContent status, and nothing may be
+written to the volume. The benchmark result is the same, with the store
+recorded, so a PVC run and an S3 run of one framework can be compared. Point SNAPSHOT_E2E_FRAMEWORK_IMAGE at a local build to test an
 unpublished guide change.
 """
 
 from __future__ import annotations
 
 import os
+import re
 
 import pytest
 
@@ -44,6 +49,10 @@ RESTORE_POD_TO_TRAFFIC_DURATION = "restore.pod_create_to_traffic.duration"
 RESTORE_AGENT_TO_TRAFFIC_DURATION = "restore.agent_complete_to_traffic.duration"
 RESTORE_AGENT_TO_TRAFFIC_DISPLAY_NAME = "Agent restore complete to traffic ready"
 GPU_PRODUCT_NODE_LABEL = "nvidia.com/gpu.product"
+
+
+def over_s3() -> bool:
+    return os.environ.get("SNAPSHOT_E2E_STORAGE") == "s3"
 
 
 def _phase_display_name(phase: str) -> str:
@@ -89,7 +98,7 @@ def framework(request: pytest.FixtureRequest) -> frameworks.FrameworkSpec:
     name = request.param
     if name not in frameworks.selected_frameworks():
         pytest.skip(f"{name} not selected by SNAPSHOT_E2E_FRAMEWORK")
-    return frameworks.FRAMEWORKS[name]
+    return frameworks.framework_spec(name)
 
 
 @pytest.mark.framework
@@ -102,13 +111,13 @@ def test_framework_checkpoint_restore_serves_inference(
 ) -> None:
     result = benchmark.start(
         suite="framework-checkpoint-restore",
-        case=framework.name,
+        case=f"{framework.case_name}-s3" if over_s3() else framework.case_name,
         environment={
             "namespace": config.namespace,
             "model": framework.model,
-            "storageClass": os.environ.get(
-                "SNAPSHOT_E2E_STORAGE_CLASS", "cluster-default"
-            ),
+            "storageClass": "s3"
+            if over_s3()
+            else os.environ.get("SNAPSHOT_E2E_STORAGE_CLASS", "cluster-default"),
             "modelCacheMode": "unknown",
             "datadogGpuMonitoringMode": os.environ.get(
                 "SNAPSHOT_E2E_DATADOG_GPU_MONITORING", "unknown"
@@ -150,21 +159,31 @@ def test_framework_checkpoint_restore_serves_inference(
                 snap.ensure_pvc(guide_pvc)
 
         k8s.apply_configmap(config.namespace, fw.app_configmap(config=config, spec=framework))
-        k8s.create_pod(
-            fw.source_pod(
-                config=config,
-                run=run,
-                spec=framework,
-                image=framework_image,
-                model_cache=model_cache,
-            )
+        source_manifest = fw.source_pod(
+            config=config,
+            run=run,
+            spec=framework,
+            image=framework_image,
+            model_cache=model_cache,
         )
+        multi_gpu = source_manifest["metadata"]["annotations"].get(fw.MULTI_GPU_ANNOTATION)
+        k8s.create_pod(source_manifest)
         source = snap.wait_for_pod_ready(
             config.namespace,
             run.source_pod,
-            timeout=frameworks.SOURCE_READY_TIMEOUT_SECONDS,
+            timeout=framework.source_ready_timeout_seconds,
         )
         source_node = source.spec.node_name
+        source_libraries = (
+            fw.cuinterpose_library_hashes(config, source) if multi_gpu == "enabled" else None
+        )
+        source_main = next(c for c in source.spec.containers if c.name == frameworks.CONTAINER)
+        model, revision, parallelism = frameworks.guide_model(source_main.args)
+        prompts = inference.chat_prompts(config.namespace, run.source_pod, model, revision)
+        result.update_environment(comparisonDimensions={
+            "multiGpu": multi_gpu or "disabled",
+            "tensorParallelSize": parallelism,
+        })
         result.redact(source_node, "source-node")
         result.mark_event("source.ready")
         _record_framework_image_digest(result, source)
@@ -189,11 +208,18 @@ def test_framework_checkpoint_restore_serves_inference(
         pod_snapshot, content = snap.wait_for_snapshot_ready(
             config.namespace,
             run.snapshot_name,
-            timeout=frameworks.CHECKPOINT_TIMEOUT_SECONDS,
+            timeout=framework.checkpoint_timeout_seconds,
         )
         result.finish_duration(CHECKPOINT_DURATION, event="checkpoint.ready")
         assert pod_snapshot["status"]["boundSnapshotContentName"] == content["metadata"]["name"]
         assert content["spec"]["source"]["nodeName"] == source_node
+        if over_s3():
+            assert re.fullmatch(r"store-v1-[0-9a-f]{64}", content["spec"]["storage"]["storeID"])
+            artifacts = content["status"]["storage"]["artifacts"]
+            assert [artifact["containerName"] for artifact in artifacts] == [frameworks.CONTAINER]
+            assert not snap.artifact_root_exists(
+                config, source_node, content["metadata"]["uid"]
+            ), "the checkpoint must not also be written to the checkpoint volume"
 
         k8s.delete_pod(config.namespace, run.source_pod)
         snap.wait_for_pod_deleted(
@@ -240,22 +266,27 @@ def test_framework_checkpoint_restore_serves_inference(
                 event="traffic.ready",
             ),
         )
+        assert restored_pod.spec.node_name == source_node
         restored_text = restored_text.strip()
         restore_node = restored_pod.spec.node_name
         result.redact(restore_node, "restore-node")
         assert restored_text, f"{framework.restore_ready_file} is empty"
         print(f"[{framework.name}] first post-restore generation: {restored_text!r}")
+        if source_libraries is not None:
+            assert fw.cuinterpose_library_hashes(config, restored_pod) == source_libraries, (
+                "restored guide libraries differ from the captured bundle"
+            )
 
-        answer = inference.request_generate(config.namespace, run.restore_pod, frameworks.PROMPT)
-        print(f"[{framework.name}] /generate after restore: {answer!r}")
+        answers = inference.verify_chat_answers(config.namespace, run.restore_pod, prompts)
+        print(f"[{framework.name}] /generate after restore: {answers!r}")
 
-        # The placeholder's own entrypoint must have stayed in standby. If it
-        # had loaded a model, its log would show the pre-checkpoint line and
-        # the "restore" would be an ordinary cold start wearing a Restored
-        # condition.
+        # The container's own command, the source's app.py, must not have
+        # run: the restore proxy replaces it. Had it loaded a model, its log
+        # would show the pre-checkpoint line and the "restore" would be an
+        # ordinary cold start wearing a Restored condition.
         restore_logs = k8s.pod_logs(config.namespace, run.restore_pod, tail_lines=2000)
         assert "pre-checkpoint output=" not in restore_logs, (
-            "restore placeholder loaded a model itself instead of staying in standby"
+            "the restore container loaded a model itself instead of being restored"
         )
         result.mark_event("inference.verified")
         result.finish_test()
@@ -399,6 +430,12 @@ def _record_storage_environment(
     config: k8s.E2EConfig,
 ) -> None:
     """Records the bound checkpoint PVC and its provisioner best-effort."""
+    if over_s3():
+        result.update_environment(
+            storageClass="s3",
+            storage={"storageClass": "s3", "type": "s3", "provisioner": "s3-compatible"},
+        )
+        return
     try:
         pvc = k8s.read_pvc(config.namespace, config.pvc_name)
         storage_class_name = pvc.spec.storage_class_name
@@ -586,6 +623,14 @@ def _record_agent_summary(
     for phase, duration in summary.phases_seconds.items():
         result.record_measurement(
             *agent_duration(operation, phase),
+            "seconds",
+            duration,
+        )
+    for name, duration in summary.nested_seconds.items():
+        group, key = name.split(".", 1)
+        result.record_measurement(
+            f"{operation}.{name}.duration",
+            f"{operation.capitalize()} {_phase_display_name(group)} {_phase_display_name(key)}",
             "seconds",
             duration,
         )

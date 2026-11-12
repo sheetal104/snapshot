@@ -11,9 +11,10 @@ artifact. See docs/development/benchmarks-guide.md for why.
 
 from __future__ import annotations
 
+from statistics import mean, stdev
 from typing import Any
 
-SUPPORTED_SCHEMA_VERSIONS = (1,)
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 
 
 def _normalize_result(result: dict) -> dict:
@@ -26,7 +27,7 @@ def _normalize_result(result: dict) -> dict:
     # `type(...) is int` rather than `isinstance`/`==` on purpose: `bool` is an
     # `int` subclass (`isinstance(True, int)` is `True`) and `1.0 == 1`, so
     # either check would silently accept `True`/`1.0` as schema_version 1.
-    if type(version) is int and version == 1:
+    if type(version) is int and version in SUPPORTED_SCHEMA_VERSIONS:
         return result
     run_id = result.get("run_id", "<unknown>")
     label = (result.get("model") or {}).get("label", "<unknown>")
@@ -67,14 +68,480 @@ def _fmt_driver(identity: dict) -> str:
     return "-"
 
 
+def _table(headers, rows):
+    return "\n".join(
+        [
+            "| " + " | ".join(headers) + " |",
+            "| " + " | ".join(["---"] * len(headers)) + " |",
+        ]
+        + ["| " + " | ".join(map(str, row)) + " |" for row in rows]
+    )
+
+
+def _cold_phases(measured):
+    phases = measured["phases_s"]
+    raw = [
+        phases["Process/worker startup"] + phases["Runtime imports"],
+        phases["Model construction and weights"],
+        sum(
+            phases[k]
+            for k in (
+                "Memory profiling",
+                "Attention/sampler/kernel initialization",
+                "MHC kernel prewarm",
+            )
+        ),
+        sum(
+            phases[k]
+            for k in (
+                "Compilation and JIT module loading",
+                "Autotuning",
+                "CUDA graph capture",
+            )
+        ),
+    ]
+    if sum(raw) <= 0:
+        raise ValueError("Cold start has no measured phases")
+    return raw
+
+
+def _spread(values: list[float | None], digits: int = 3) -> str:
+    """Mean ± sample standard deviation, or the raw value when there is one."""
+    present = [value for value in values if value is not None]
+    if not present:
+        return "-"
+    if len(present) == 1:
+        return _fmt(present[0], digits)
+    return f"{_fmt(mean(present), digits)} ± {_fmt(stdev(present), digits)}"
+
+
+def _spread_bytes(values: list[int | None]) -> str:
+    present = [value for value in values if value is not None]
+    if not present:
+        return "-"
+    if len(present) == 1:
+        return _fmt_bytes(present[0])
+    return f"{mean(present) / 1e9:.2f} ± {stdev(present) / 1e9:.2f} GB"
+
+
+def _capture_groups(results: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Repeats of one model, in the order the models first appear."""
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for result in results:
+        if not result.get("checkpoint_agent_log"):
+            continue
+        label = (result.get("model") or {}).get("label", "-")
+        if label not in groups:
+            order.append(label)
+            groups[label] = []
+        groups[label].append(result)
+    return [(label, groups[label]) for label in order]
+
+
+def _criu_read(capture: dict) -> float | None:
+    """memdump minus memwrite, computed here so results saved before the
+    ``criu_read`` property existed still render it."""
+    memdump, memwrite = capture.get("criu_memdump"), capture.get("criu_memwrite")
+    if memdump is None or memwrite is None or memwrite > memdump:
+        return None
+    return memdump - memwrite
+
+
+def _capture_field(result: dict, name: str) -> float | None:
+    return (result.get("checkpoint_agent_log") or {}).get(name)
+
+
+def _capture_phase(result: dict, name: str) -> float | None:
+    return ((result.get("checkpoint_agent_log") or {}).get("phases") or {}).get(name)
+
+
+def _staging_bytes(result: dict) -> int | None:
+    capture = result.get("checkpoint_agent_log") or {}
+    return capture.get("checkpoint_dir_bytes_before_overlay", capture.get("criu_image_bytes"))
+
+
+def _page_size(result: dict) -> int | None:
+    """Host page size implied by the agent's own counters, or None.
+
+    ``pages_written_bytes`` is ``pages_written`` times the agent host's page
+    size, so the ratio recovers it. It is not assumed to be 4096: arm64 hosts
+    can use 16 KiB or 64 KiB pages.
+    """
+    capture = result.get("checkpoint_agent_log") or {}
+    pages = capture.get("criu_pages_written")
+    written = capture.get("criu_pages_written_bytes")
+    if not pages or not written or written % pages:
+        return None
+    return written // pages
+
+
+def _hole_sentence(result: dict, image: dict) -> str:
+    holes = image.get("pagemap_holes", 0)
+    size = _page_size(result)
+    amount = f"{holes}"
+    if size and holes:
+        amount += f" ({_fmt_bytes(holes * size)} at {size // 1024} KiB pages)"
+    return (
+        f"Pagemap holes {amount} are pages CRIU skipped because a parent "
+        "image already holds them. That count is `pages_skipped_parent` and "
+        "is zero without `--prev-images-dir`. It is not file sparseness."
+    )
+
+
+def _image_section(results: list[dict]) -> list[str]:
+    """Names the files in the checkpoint and the CRIU log lines around the dump."""
+    lines = [
+        "## What is in the checkpoint image",
+        "",
+        "Categories sum every file. Apparent size counts sparse holes; "
+        "allocated size is `st_blocks * 512`. Files lists only those of at "
+        "least 1 MiB. `pages` is CRIU's private page images. Dump log times "
+        "are CRIU's own clock. CRIU dumps one task at a time (pages, then "
+        "core, then threads and mm), so on a multi-process tree such as vLLM "
+        "the first `Dumping core` can come before the last `Pagemap "
+        "generated`. The first `Dumping core` at or after the last pagemap is "
+        "the earliest point where every task's private pages are written. "
+        "Shared anonymous memory is written after `Dumping pstree`, so the "
+        "time from there to `Dumping finished` is not only killing the "
+        "frozen tree. Thread cores are one line per thread, summarized as "
+        "first–last. `Unfreezing tasks` is the start of killing the frozen "
+        "tree, and `Writing stats` is after that wait. `Dumping finished` is "
+        "the end.",
+        "",
+    ]
+    for result in results:
+        image = result.get("checkpoint_image") or {}
+        if not image:
+            continue
+        label = (result.get("model") or {}).get("label", "-")
+        lines.append(f"### {label}")
+        lines.append("")
+        lines.append("| Category | Apparent | Allocated | Files |")
+        lines.append("|---|---:|---:|---:|")
+        for category in image.get("categories") or []:
+            lines.append(
+                f"| {category.get('name', '-')} | {_fmt_bytes(category.get('bytes'))} | "
+                f"{_fmt_bytes(category.get('allocated_bytes'))} | "
+                f"{category.get('file_count', '-')} |"
+            )
+        lines.append("")
+        lines.append("| Dump log | Offset (s) |")
+        lines.append("|---|---:|")
+        for name, offset in _dump_marks(image):
+            lines.append(f"| {name} | {offset} |")
+        lines.append("")
+        lines.append(
+            f"Pages apparent {_fmt_bytes(image.get('pages_bytes'))}, "
+            f"allocated {_fmt_bytes(image.get('pages_allocated_bytes'))}, "
+            f"sparse {_fmt_bytes(image.get('pages_sparse_bytes'))}."
+        )
+        lines.append("")
+        lines.append(_hole_sentence(result, image))
+        lines.append("")
+        large = image.get("files") or []
+        if large:
+            lines.append("| File | Apparent | Allocated |")
+            lines.append("|---|---:|---:|")
+            for item in large:
+                lines.append(
+                    f"| `{item.get('path', '-')}` | {_fmt_bytes(item.get('bytes'))} | "
+                    f"{_fmt_bytes(item.get('allocated_bytes'))} |"
+                )
+            lines.append("")
+    return lines
+
+
+def _dump_marks(image: dict) -> list[tuple[str, str]]:
+    first = image.get("thread_core_first_seconds")
+    last = image.get("thread_core_last_seconds")
+    count = image.get("thread_core_count") or 0
+    if first is None and last is None:
+        thread_span = "-"
+    else:
+        thread_span = f"{_fmt(first)}–{_fmt(last)} ({count})"
+    return [
+        ("First Dumping pages", _fmt(image.get("first_dumping_pages_seconds"))),
+        ("First Dumping core", _fmt(image.get("first_dumping_core_seconds"))),
+        ("Last Pagemap generated", _fmt(image.get("last_pagemap_seconds"))),
+        (
+            "Dumping core at or after last pagemap",
+            _fmt(image.get("core_after_last_pagemap_seconds")),
+        ),
+        ("Thread cores", thread_span),
+        ("Dumping mm", _fmt(image.get("dumping_mm_seconds"))),
+        ("Dumping pstree", _fmt(image.get("dumping_pstree_seconds"))),
+        ("Namespaces complete", _fmt(image.get("namespaces_complete_seconds"))),
+        ("Unfreezing tasks", _fmt(image.get("unfreezing_seconds"))),
+        ("Writing stats", _fmt(image.get("writing_stats_seconds"))),
+        ("Dumping finished", _fmt(image.get("dumping_finished_seconds"))),
+    ]
+
+
+def _capture_sections(results: list[dict]) -> list[str]:
+    """Capture breakdown. Skips results that have no checkpoint agent log."""
+    lines = [
+        "## Where the capture time goes",
+        "",
+        "Wall, CUDA, CRIU, and overlay come from the capture-node agent's "
+        "Checkpoint timing summary. CUDA lock is the device freeze; CUDA copy "
+        "moves device state into host memory before CRIU runs. Those CUDA "
+        "columns are blank when the capture used PageBroker CustomStorage, "
+        "which records the CUDA total and does not measure the split. CRIU "
+        "memdump is CRIU's page-dump timer and it includes memwrite, the time "
+        "spent writing pages. CRIU read is memdump minus memwrite. memdump "
+        "and memwrite overlap the CRIU wall; they are not added to it or to "
+        "each other. Checkpoint (API) is the one-second Kubernetes Ready "
+        "timestamp and is coarser than Wall. Repeated runs of the same model "
+        "are one row, the mean ± the sample standard deviation. A single run "
+        "is the raw value.",
+        "",
+        "| Model | Wall (s) | CUDA lock | CUDA copy | CRIU wall | CRIU freeze | "
+        "CRIU memdump | of which memwrite | CRIU read | Overlay | Checkpoint (API) |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for label, group in _capture_groups(results):
+        lines.append(
+            "| {label} | {wall} | {lock} | {copy} | {criu} | {freeze} | {memdump} | "
+            "{memwrite} | {read} | {overlay} | {api} |".format(
+                label=label,
+                wall=_spread([_capture_field(result, "duration") for result in group]),
+                lock=_spread([_capture_field(result, "cuda_lock") for result in group]),
+                copy=_spread([_capture_field(result, "cuda_copy") for result in group]),
+                criu=_spread([_capture_phase(result, "criu_dump") for result in group]),
+                freeze=_spread([_capture_field(result, "criu_freezing") for result in group]),
+                memdump=_spread([_capture_field(result, "criu_memdump") for result in group]),
+                memwrite=_spread([_capture_field(result, "criu_memwrite") for result in group]),
+                read=_spread([_criu_read(result.get("checkpoint_agent_log") or {}) for result in group]),
+                overlay=_spread([_capture_phase(result, "overlay_capture") for result in group]),
+                api=_spread(
+                    [
+                        (result.get("checkpoint") or {}).get("checkpoint_seconds")
+                        for result in group
+                    ]
+                ),
+            )
+        )
+    lines.append("")
+    lines.extend(
+        [
+            "## How the pages were written",
+            "",
+            "Memwrite GB/s divides CRIU's written page bytes (`pages_written`) "
+            "by CRIU's memwrite timer. The staging directory column is the "
+            "apparent size of the checkpoint directory after CRIU returns and "
+            "before the rootfs diff is added. It includes the manifest, "
+            "dump.log, CUDA job file, and criu.conf, so it is neither the CRIU "
+            "image nor the final checkpoint size, and it is not turned into a "
+            "rate against the dump wall. Repeated runs of the same model are "
+            "one row, the mean ± the sample standard deviation.",
+            "",
+            "| Model | Pages written | Staging dir before overlay | Overlay diff | Memwrite GB/s |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for label, group in _capture_groups(results):
+        lines.append(
+            "| {label} | {pages} | {staging} | {overlay} | {memwrite_rate} |".format(
+                label=label,
+                pages=_spread_bytes(
+                    [_capture_field(result, "criu_pages_written_bytes") for result in group]
+                ),
+                staging=_spread_bytes([_staging_bytes(result) for result in group]),
+                overlay=_spread_bytes(
+                    [_capture_field(result, "overlay_diff_bytes") for result in group]
+                ),
+                memwrite_rate=_spread(
+                    [_capture_field(result, "memwrite_gigabytes_per_second") for result in group]
+                ),
+            )
+        )
+    lines.append("")
+    return lines
+
+
+def _agent_log_warnings(results: list[dict]) -> list[tuple[str, str]]:
+    return [
+        (r.get("model", {}).get("label", "?"), w)
+        for r in results
+        for w in (
+            ((r.get("agent_log_phases") or {}).get("parse_warnings") or [])
+            + ((r.get("checkpoint_agent_log") or {}).get("parse_warnings") or [])
+            + ((r.get("checkpoint_image") or {}).get("parse_warnings") or [])
+        )
+    ]
+
+
 def render(results: list[dict]) -> str:
+    if not results:
+        return "no results found\n"
+    results = [_normalize_result(r) for r in results]
+    legacy = [r for r in results if r["schema_version"] == 1]
+    current = [r for r in results if r["schema_version"] == 2]
+    if not current:
+        return _render_legacy(legacy)
+    headline, cold, restore, environment = [], [], [], []
+    f = lambda value: "-" if value is None else f"{value:.2f}"
+    for r in current:
+        model, engine, env = r["model"], r["engine"], r["environment"]
+        topology = f"TP{model['tp']}"
+        if model["ep"] > 1:
+            topology = "TEP8" if model["tp"] == model["ep"] == 8 else f"{topology}/EP{model['ep']}"
+        prefix = [model["label"], engine["name"], topology]
+        elapsed = r["cold_start"]["startup_to_ready_seconds"]
+        timings = [
+            a["measurement"]
+            for a in r.get("restore_attempts", [])
+            if a.get("measurement")
+        ]
+        if not timings and (r.get("restore") or {}).get("measurement"):
+            timings = [r["restore"]["measurement"]]
+        restored = mean(t["total_s"] for t in timings) if timings else None
+
+        def spread(key):
+            values = [t[key] for t in timings]
+            return (
+                f(mean(values)) + " ± " + (f(stdev(values)) if len(values) > 1 else "—")
+            )
+
+        headline.append(
+            prefix
+            + [
+                _fmt_bytes(model.get("reported_weights_bytes")),
+                _fmt_bytes(model.get("checkpoint_artifact_bytes")),
+                f((r.get("checkpoint") or {}).get("checkpoint_seconds")),
+                f(elapsed),
+                spread("total_s") if timings else "-",
+                f(elapsed / restored) + "×" if restored and elapsed is not None else "-",
+            ]
+        )
+        measurement = r["cold_start"]["measurement"] or {}
+        if measurement.get("phases_s"):
+            cold.append(
+                prefix
+                + [f(v) for v in _cold_phases(measurement)]
+                + [f(elapsed)]
+            )
+        if timings:
+            restore.append(
+                prefix
+                + [
+                    spread(k)
+                    for k in (
+                        "setup_s",
+                        "criu_s",
+                        "cuda_s",
+                        "wake_handoff_s",
+                        "total_s",
+                    )
+                ]
+            )
+        capture, destination = env.get("capture") or {}, env.get("restore") or {}
+        environment.append(
+            prefix
+            + [
+                engine.get("version") or "-",
+                capture.get("gpu_product") or "-",
+                _fmt_driver(capture),
+                destination.get("gpu_product") or "-",
+                _fmt_driver(destination),
+                env.get("storage_class") or "-",
+                env.get("placement") or "-",
+            ]
+        )
+    text = "# Snapshot benchmark results\n\n## Cold start compared with Snapshot\n\n"
+    text += _table(
+        [
+            "Model",
+            "Engine",
+            "Parallelism",
+            "Weights",
+            "Checkpoint size",
+            "Checkpoint (s)",
+            "Cold start (s)",
+            "Restore (s, mean ± SD)",
+            "Speedup",
+        ],
+        headline,
+    )
+    text += "\n\nThe report averages the recorded restore times and shows their sample standard deviation. Cold-start and checkpoint values are reported without a standard deviation. Speedup uses the mean restore time. Older single-attempt results show — for standard deviation.\n"
+    if cold:
+        text += "\n\n## Where the cold start time goes (s)\n\n"
+        text += _table(
+            [
+                "Model",
+                "Engine",
+                "Parallelism",
+                "Startup",
+                "Model load",
+                "Initialization",
+                "Compilation, autotuning & graph capture",
+                "Total",
+            ],
+            cold,
+        )
+    text += "\n\nEach run saves the raw timings.\n\n## Where the restore time goes (s)\n\n"
+    text += _table(
+        [
+            "Model",
+            "Engine",
+            "Parallelism",
+            "Agent setup / rootfs",
+            "CRIU restore",
+            "CUDA restore",
+            "Wake",
+            "Total",
+        ],
+        restore,
+    )
+    text += "\n\nRestore ends at wake/resume completion, before inference. CUDA restore includes multi-GPU reconstruction.\n\n## Observed environment\n\n"
+    text += (
+        _table(
+            [
+                "Model",
+                "Engine",
+                "Parallelism",
+                "Engine version",
+                "Capture GPU",
+                "Capture driver",
+                "Restore GPU",
+                "Restore driver",
+                "Storage class",
+                "Placement",
+            ],
+            environment,
+        )
+        + "\n"
+    )
+    if any(r.get("checkpoint_agent_log") for r in current):
+        text += "\n" + "\n".join(_capture_sections(current))
+    if any(r.get("checkpoint_image") for r in current):
+        text += "\n" + "\n".join(_image_section(current))
+    warnings = [
+        f"- {r['model']['label']}: {warning}"
+        for r in current
+        for warning in r.get("warnings", [])
+    ] + [f"- {label}: {warning}" for label, warning in _agent_log_warnings(current)]
+    if warnings:
+        text += "\n## Warnings\n\n" + "\n".join(warnings) + "\n"
+    if legacy:
+        text += (
+            "\n## Legacy measurements (different timing boundaries)\n\n"
+            + _render_legacy(legacy)
+        )
+    return text
+
+
+def _render_legacy(results: list[dict]) -> str:
     if not results:
         return "no results found\n"
 
     results = [_normalize_result(r) for r in results]
 
     lines: list[str] = []
-    lines.append("# Snapshot benchmark results (standalone report, not published doc content)")
+    lines.append(
+        "# Snapshot benchmark results (standalone report, not published doc content)"
+    )
     lines.append("")
     lines.append(
         "Absolute numbers below are only comparable to "
@@ -136,12 +603,18 @@ def render(results: list[dict]) -> str:
         )
     lines.append("")
 
+    if any(r.get("checkpoint_agent_log") for r in results):
+        lines.extend(_capture_sections(results))
+
+    if any(r.get("checkpoint_image") for r in results):
+        lines.extend(_image_section(results))
+
     lines.append("## Where the restore time goes")
     lines.append("")
     lines.append(
         "Columns ending in `(approx)` are a best-effort remap of the node "
-        'agent\'s own phase names to the published doc\'s 4-stage vocabulary '
-        '-- see AgentLogPhases in schema.py for the exact mapping. '
+        "agent's own phase names to the published doc's 4-stage vocabulary "
+        "-- see AgentLogPhases in schema.py for the exact mapping. "
         '"wake/remap" is not represented in the agent log at all; use the '
         '"Snapshot restore" / "vLLM wake+copy" columns instead, which are '
         "derived from the nvidia.com/Restored pod condition and are exact, "
@@ -175,11 +648,7 @@ def render(results: list[dict]) -> str:
         for r in results
         for w in (r.get("warnings") or [])
     ]
-    agent_log_warnings = [
-        (r.get("model", {}).get("label", "?"), w)
-        for r in results
-        for w in ((r.get("agent_log_phases") or {}).get("parse_warnings") or [])
-    ]
+    agent_log_warnings = _agent_log_warnings(results)
     if warnings or agent_log_warnings:
         lines.append("## Warnings")
         lines.append("")

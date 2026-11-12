@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 
 	"github.com/ai-dynamo/snapshot/agent/internal/nsmount"
+	"github.com/ai-dynamo/snapshot/agent/internal/pagebroker"
 	"github.com/ai-dynamo/snapshot/agent/internal/types"
 	snapshotv1alpha1 "github.com/ai-dynamo/snapshot/api/v1alpha1"
 )
@@ -23,7 +24,11 @@ const recordedImageDigest = "sha256:9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c
 func recordedManifest() *types.CheckpointManifest {
 	return &types.CheckpointManifest{
 		Artifact: types.ArtifactManifest{ContentUID: "content-uid-1", ContainerName: "main"},
-		Host:     types.HostManifest{KernelVersion: "5.15.0-1071-aws", CPUArch: "amd64"},
+		Host: types.HostManifest{
+			KernelVersion: "5.15.0-1071-aws",
+			CPUArch:       "amd64",
+			CPUFeatures:   []string{"avx2", "avx512f", "sse2"},
+		},
 		K8s: types.SourcePodManifest{
 			SourceNode:  "gpu-node-3",
 			Image:       "nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.6.1",
@@ -59,6 +64,7 @@ func recordedSource() *snapshotv1alpha1.CheckpointSource {
 			Name:          "gpu-node-3",
 			Architecture:  "amd64",
 			KernelVersion: "5.15.0-1071-aws",
+			CPUFeatures:   []string{"avx2", "avx512f", "sse2"},
 		},
 		Pod: &snapshotv1alpha1.CheckpointSourcePod{
 			Image:       "nvcr.io/nvidia/ai-dynamo/vllm-runtime:0.6.1",
@@ -126,6 +132,10 @@ func TestCheckpointSourceFromManifest(t *testing.T) {
 			}),
 			want: sourceWith(func(s *snapshotv1alpha1.CheckpointSource) { s.Node = nil }),
 		},
+		"CPU flags the agent could not read": {
+			manifest: manifestWith(func(m *types.CheckpointManifest) { m.Host.CPUFeatures = nil }),
+			want:     sourceWith(func(s *snapshotv1alpha1.CheckpointSource) { s.Node.CPUFeatures = nil }),
+		},
 		// The count is the instance list, so an artifact that recorded UUIDs
 		// before models were recorded still says how many GPUs it had.
 		"GPUs recorded before their models were": {
@@ -186,7 +196,7 @@ func TestMarkCheckpointReadyPublishesWhatTheCaptureRecorded(t *testing.T) {
 	w := makeNodeController(t, &fakeCheckpointer{}, content)
 	path := committedArtifact(t, w, string(content.UID))
 
-	require.NoError(t, w.markCheckpointReady(context.Background(), content, path))
+	require.NoError(t, w.markCheckpointReady(context.Background(), content, path, "", nil))
 
 	assertPublishedTheRecordedSource(t, getContent(t, w, content.Name))
 }
@@ -197,7 +207,7 @@ func TestMarkCheckpointReadyGoesReadyWhenTheManifestCannotBeRead(t *testing.T) {
 	content := makeWorkOrder("podsnapshotcontent-abc", "node-a", "abc")
 	w := makeNodeController(t, &fakeCheckpointer{}, content)
 
-	require.NoError(t, w.markCheckpointReady(context.Background(), content, t.TempDir()))
+	require.NoError(t, w.markCheckpointReady(context.Background(), content, t.TempDir(), "", nil))
 
 	got := getContent(t, w, content.Name)
 	assert.NotNil(t, meta.FindStatusCondition(got.Status.Conditions, snapshotv1alpha1.PodSnapshotConditionReady))
@@ -209,9 +219,9 @@ func TestFreshCapturePublishesTheSourceItRecorded(t *testing.T) {
 	pod := makeSourcePod()
 	w := makeNodeController(t, &fakeCheckpointer{}, content, pod)
 	w.runtime = &fakeRuntime{resolveContainerPID: 7}
-	w.checkpointFn = func(_ context.Context, params CheckpointParams) error {
+	w.checkpointFn = func(_ context.Context, params CheckpointParams) (*pagebroker.PublishedArtifact, error) {
 		committedArtifact(t, w, params.ContentUID)
-		return nil
+		return nil, nil
 	}
 
 	require.NoError(t, w.reconcileCapture(context.Background(), content.Name))

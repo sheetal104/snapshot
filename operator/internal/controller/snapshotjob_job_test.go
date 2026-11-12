@@ -35,6 +35,122 @@ func minimalSnapshotJob() *snapshotv1alpha1.SnapshotJob {
 	}
 }
 
+func TestBuildSourceJobKeepsTheReadinessProbeForACheckpointReadinessProbe(t *testing.T) {
+	serving := &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"serving-check"}}}}
+	for _, tc := range []struct {
+		name     string
+		settings []snapshotv1alpha1.ContainerSnapshotConfig
+		keep     bool
+	}{
+		{"no settings", nil, false},
+		{"settings without a probe", []snapshotv1alpha1.ContainerSnapshotConfig{{Name: "worker"}}, false},
+		{"a probe on the target", []snapshotv1alpha1.ContainerSnapshotConfig{{
+			Name:                     "worker",
+			CheckpointReadinessProbe: &snapshotv1alpha1.CheckpointReadinessProbe{},
+		}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sj := minimalSnapshotJob()
+			sj.Spec.PodTemplate.Spec.Containers[0].ReadinessProbe = serving
+			sj.Spec.PodSnapshotTemplate.Containers = tc.settings
+
+			job, err := buildSourceJob(sj)
+			require.NoError(t, err)
+
+			probe := requireContainer(t, job.Spec.Template.Spec.Containers, "worker").ReadinessProbe
+			require.NotNil(t, probe)
+			require.NotNil(t, probe.Exec)
+			if tc.keep {
+				assert.Equal(t, []string{"serving-check"}, probe.Exec.Command, "the workload's own readiness probe is kept")
+				return
+			}
+			assert.Equal(t, []string{"cat", podcontract.SnapshotControlMountPath + "/" + podcontract.ReadyForSnapshotFile},
+				probe.Exec.Command, "Ready gates the checkpoint, so the ready-file probe replaces the workload's")
+		})
+	}
+}
+
+func TestBuildSourceJobNonTargetArtifactContract(t *testing.T) {
+	makeJob := func() *snapshotv1alpha1.SnapshotJob {
+		sj := minimalSnapshotJob()
+		sj.Spec.NonTargetArtifacts = &snapshotv1alpha1.NonTargetArtifactPolicy{Containers: []string{"saver"}}
+		sj.Spec.PodTemplate.Spec.Containers = append(sj.Spec.PodTemplate.Spec.Containers, corev1.Container{Name: "saver"})
+		return sj
+	}
+	sj := makeJob()
+	job, err := buildSourceJob(sj)
+	require.NoError(t, err)
+	saver := requireContainer(t, job.Spec.Template.Spec.Containers, "saver")
+	assert.Contains(t, saver.Env, corev1.EnvVar{Name: podcontract.SnapshotJobUIDEnv, Value: "sj-uid"})
+	assert.Contains(t, saver.Env, corev1.EnvVar{Name: podcontract.NonTargetArtifactSubdirEnv, Value: "non-target-artifacts/sj-uid"})
+	assert.Equal(t, "saver", job.Spec.Template.Annotations[podcontract.NonTargetArtifactContainersAnnotation])
+	assert.Empty(t, sj.Spec.PodTemplate.Spec.Containers[1].Env, "injection must not mutate the caller's template")
+	snap, err := buildPodSnapshot(sj, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "source", UID: "pod-uid"}})
+	require.NoError(t, err)
+	assert.Equal(t, "saver", snap.Annotations[podcontract.NonTargetArtifactContainersAnnotation])
+	assert.Equal(t, "sj-uid", snap.Labels[snapshotv1alpha1.SnapshotJobOwnerUIDLabel])
+	legacy := minimalSnapshotJob()
+	legacy.Spec.PodTemplate.Annotations = map[string]string{podcontract.NonTargetArtifactContainersAnnotation: "saver"}
+	legacy.Spec.PodTemplate.Spec.Containers = append(legacy.Spec.PodTemplate.Spec.Containers, corev1.Container{Name: "saver"})
+	legacyJob, err := buildSourceJob(legacy)
+	require.NoError(t, err, "existing annotation-only jobs remain runnable after an operator upgrade")
+	assert.Equal(t, "saver", legacyJob.Spec.Template.Annotations[podcontract.NonTargetArtifactContainersAnnotation])
+	legacySnap, err := buildPodSnapshot(legacy, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "source", UID: "pod-uid"}})
+	require.NoError(t, err)
+	assert.Equal(t, "saver", legacySnap.Annotations[podcontract.NonTargetArtifactContainersAnnotation])
+
+	withOutputPath := makeJob()
+	withOutputPath.Spec.PodTemplate.Spec.Containers[1].Env = []corev1.EnvVar{{
+		Name: "OUT", Value: "/mnt/$(SNAPSHOT_NON_TARGET_ARTIFACT_SUBDIR)",
+	}}
+	outputJob, err := buildSourceJob(withOutputPath)
+	require.NoError(t, err)
+	outputSaver := requireContainer(t, outputJob.Spec.Template.Spec.Containers, "saver")
+	require.Len(t, outputSaver.Env, 3)
+	assert.Equal(t, podcontract.SnapshotJobUIDEnv, outputSaver.Env[0].Name)
+	assert.Equal(t, podcontract.NonTargetArtifactSubdirEnv, outputSaver.Env[1].Name)
+	assert.Equal(t, "OUT", outputSaver.Env[2].Name)
+	assert.Len(t, withOutputPath.Spec.PodTemplate.Spec.Containers[1].Env, 1, "injection must not mutate the caller's template")
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*snapshotv1alpha1.SnapshotJob)
+	}{
+		{"target", func(sj *snapshotv1alpha1.SnapshotJob) {
+			sj.Spec.NonTargetArtifacts.Containers = []string{"worker"}
+		}},
+		{"missing", func(sj *snapshotv1alpha1.SnapshotJob) {
+			sj.Spec.NonTargetArtifacts.Containers = []string{"missing"}
+		}},
+		{"duplicate", func(sj *snapshotv1alpha1.SnapshotJob) {
+			sj.Spec.NonTargetArtifacts.Containers = []string{"saver", "saver"}
+		}},
+		{"empty", func(sj *snapshotv1alpha1.SnapshotJob) {
+			sj.Spec.NonTargetArtifacts.Containers = nil
+		}},
+		{"competing annotation", func(sj *snapshotv1alpha1.SnapshotJob) {
+			sj.Spec.PodTemplate.Annotations = map[string]string{podcontract.NonTargetArtifactContainersAnnotation: "worker"}
+		}},
+		{"init helper", func(sj *snapshotv1alpha1.SnapshotJob) {
+			sj.Spec.PodTemplate.Spec.Containers = sj.Spec.PodTemplate.Spec.Containers[:1]
+			sj.Spec.PodTemplate.Spec.InitContainers = []corev1.Container{{Name: "saver"}}
+		}},
+		{"reserved uid", func(sj *snapshotv1alpha1.SnapshotJob) {
+			sj.Spec.PodTemplate.Spec.Containers[1].Env = []corev1.EnvVar{{Name: podcontract.SnapshotJobUIDEnv, Value: "foreign"}}
+		}},
+		{"reserved path", func(sj *snapshotv1alpha1.SnapshotJob) {
+			sj.Spec.PodTemplate.Spec.Containers[1].Env = []corev1.EnvVar{{Name: podcontract.NonTargetArtifactSubdirEnv, Value: "foreign"}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sj := makeJob()
+			tc.mutate(sj)
+			_, err := buildSourceJob(sj)
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestBuildSourceJob(t *testing.T) {
 	t.Run("wires identity, target, and options through to NewSourceJob", func(t *testing.T) {
 		sj := minimalSnapshotJob()
