@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# The capture-measurement agent image does not contain pagebroker. The agent
+# refuses to start until a pagebroker from the same commit answers its
+# capabilities check. This workflow does not run make check.
+name: Build capture measurement pagebroker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-pagebroker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push pagebroker
+        run: |
+          make docker-build-pagebroker \
+            REGISTRY=ghcr.io/${{ github.repository_owner }}/snapshot \
+            TAGS=capture-measurement \
+            DOCKER_BUILD_ARGS="--platform=linux/amd64 --push \
+              --cache-from=type=gha,scope=capture-measurement-pagebroker \
+              --cache-to=type=gha,scope=capture-measurement-pagebroker,mode=max"
