@@ -2,10 +2,10 @@
   "chunks": [
     {
       "firstStartedAt": "2026-11-01T15:45:26.858Z",
-      "lastStartedAt": "2026-11-15T16:02:17.862Z",
+      "lastStartedAt": "2026-11-16T19:11:51.020Z",
       "month": "2026-11",
       "path": "index/v1/2026-11.ndjson",
-      "recordCount": 39,
+      "recordCount": 43,
       "suites": [
         "framework-checkpoint-restore"
       ]
@@ -33,8 +33,8 @@
   ],
   "historyFormatVersion": 1,
   "manifestVersion": 1,
-  "newestResultAt": "2026-11-15T16:02:17.862Z",
-  "recordCount": 144,
+  "newestResultAt": "2026-11-16T19:11:51.020Z",
+  "recordCount": 148,
   "supportedSchemaVersions": [
     1
   ]
